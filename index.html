@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Relay Ctrl — Remote</title>
+<link rel="stylesheet" href="remote.css">
+</head>
+<body>
+
+<!-- ══ TOPBAR ══ -->
+<header id="topbar">
+  <div class="logo-mark">
+    <div class="logo-icon">⚡</div>
+    <div>
+      <div class="logo-text">Relay Ctrl</div>
+      <div class="logo-sub">Remote · MQTT</div>
+    </div>
+  </div>
+
+  <div class="topbar-div"></div>
+
+  <div class="tb-stat">
+    <div class="tb-label">Broker</div>
+    <div class="tb-val" id="tb-status">DISCONNECTED</div>
+  </div>
+
+  <div class="topbar-div"></div>
+
+  <div class="tb-stat">
+    <div class="tb-label">Devices</div>
+    <div class="tb-val amber" id="tb-devices">0</div>
+  </div>
+
+  <div class="topbar-right">
+    <div class="conn-status">
+      <span class="conn-dot" id="conn-dot"></span>
+      <span id="conn-label">offline</span>
+    </div>
+    <div id="clock">--:--:--</div>
+  </div>
+</header>
+
+<div id="wrap">
+
+  <!-- ══ SIDEBAR ══ -->
+  <nav id="sidebar">
+
+    <!-- Broker config -->
+    <div class="broker-panel">
+      <div class="section-label">MQTT Broker</div>
+      <div class="field">
+        <label>Host</label>
+        <input type="text" id="b-host" placeholder="192.168.1.x or broker.domain.com">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>WS Port</label>
+          <input type="number" id="b-port" value="9001" min="1" max="65535">
+        </div>
+        <div class="field" style="display:flex;align-items:flex-end;gap:6px;padding-bottom:0">
+          <label style="white-space:nowrap;padding-bottom:8px">
+            <input type="checkbox" id="b-ssl" style="margin-right:4px">TLS
+          </label>
+        </div>
+      </div>
+      <div class="field">
+        <label>Username <span style="color:var(--dim)">(optional)</span></label>
+        <input type="text" id="b-user" placeholder="mqtt user">
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" id="b-pass" placeholder="••••••••">
+      </div>
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-amber btn-full" id="btn-connect" onclick="mqttConnect()">⚡ Connect</button>
+        <button class="btn btn-red btn-full" id="btn-disconnect" style="display:none" onclick="mqttDisconnect()">✕ Disconnect</button>
+      </div>
+    </div>
+
+    <!-- Device list -->
+    <div class="section-label" style="padding:12px 16px 4px;margin:0">Devices</div>
+    <div class="device-list" id="device-list"></div>
+    <button class="add-device-btn" onclick="openAddDevice()">+ Add Device</button>
+
+  </nav>
+
+  <!-- ══ MAIN ══ -->
+  <main id="main">
+    <div class="empty-state">
+      <div class="empty-icon">📡</div>
+      <div class="empty-title">No Device Selected</div>
+      <div class="empty-sub">
+        Connect to your MQTT broker and add a device.<br>
+        Each device needs a topic prefix matching its firmware config.
+      </div>
+    </div>
+  </main>
+
+</div>
+
+<!-- ══ ADD / EDIT DEVICE MODAL ══ -->
+<div class="overlay" id="add-modal" onclick="if(event.target===this)closeAddModal()">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="modal-title" id="add-modal-title">Add Device</span>
+      <button class="modal-close" onclick="closeAddModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="dm-id">
+      <div class="field">
+        <label>Device Name</label>
+        <input type="text" id="dm-name" placeholder="e.g. Greenhouse, Workshop">
+      </div>
+      <div class="field">
+        <label>Topic Prefix</label>
+        <input type="text" id="dm-prefix" placeholder="home/relay">
+        <div style="font-size:9px;color:var(--dim);margin-top:4px">
+          Must match the prefix configured on the ESP32 firmware.
+        </div>
+      </div>
+      <div class="field">
+        <label>Ping Interval (sec)</label>
+        <input type="number" id="dm-ping" value="10" min="2" max="300">
+        <div style="font-size:9px;color:var(--dim);margin-top:4px">
+          How often to request a state update from the device.
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" style="flex:1" onclick="closeAddModal()">Cancel</button>
+      <button class="btn btn-amber" style="flex:2" onclick="saveDevice()">Save Device</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<!-- Paho MQTT JS (MQTT over WebSocket) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.1.0/paho-mqtt.min.js"></script>
+<script src="remote.js"></script>
+</body>
+</html>
