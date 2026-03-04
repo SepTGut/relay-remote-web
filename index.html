@@ -1,4 +1,3 @@
-<!--Just Testing-->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -42,6 +41,9 @@
             <input type="checkbox" id="b-ssl" style="width:auto">TLS/SSL
           </label>
         </div>
+      </div>
+      <div id="https-note" style="display:none;font-size:10px;color:var(--amber);margin-bottom:6px;line-height:1.5">
+        ⚠ HTTPS page — TLS forced.<br>Use port <b>8884</b> for HiveMQ WSS.
       </div>
       <div class="field"><label>Username <span style="color:var(--dim)">(optional)</span></label><input type="text" id="b-user"></div>
       <div class="field"><label>Password</label><input type="password" id="b-pass" placeholder="••••••••"></div>
@@ -93,14 +95,9 @@
       <!-- WLED-only fields -->
       <div id="dm-wled-fields" style="display:none">
         <div class="field">
-          <label>Device Host / IP</label>
-          <input type="text" id="dm-host" placeholder="192.168.1.x or hostname.local">
-          <div class="hint">Device must be reachable from this browser. Use ws:// for local, wss:// requires TLS on device.</div>
-        </div>
-        <div class="field">
-          <label>Poll Interval (sec, 0 = push only)</label>
-          <input type="number" id="dm-poll" value="0" min="0" max="300">
-          <div class="hint">WLED pushes state on every change. Set 0 to rely on push only.</div>
+          <label>WLED Device Topic</label>
+          <input type="text" id="dm-wled-topic" placeholder="wled/XXXXXX  or  home/wled/strip1">
+          <div class="hint">Must match "MQTT Device Topic" in WLED sync settings. Control goes via MQTT broker — works on HTTPS/GitHub Pages.</div>
         </div>
       </div>
     </div>
