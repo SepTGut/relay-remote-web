@@ -1,4 +1,3 @@
-<!--Just Testing...-->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -71,14 +70,37 @@
       <input type="hidden" id="dm-id">
       <div class="field"><label>Device Name</label><input type="text" id="dm-name" placeholder="e.g. Greenhouse, Workshop"></div>
       <div class="field">
-        <label>Topic Prefix</label>
-        <input type="text" id="dm-prefix" placeholder="home/relay">
-        <div class="hint">Must match the prefix in ESP32 firmware config.</div>
+        <label>Device Type</label>
+        <select id="dm-type" onchange="onDevTypeChange()" style="width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--text2);font-family:var(--mono);font-size:11px;padding:6px 8px;border-radius:3px;outline:none">
+          <option value="mqtt">Relay Controller (MQTT)</option>
+          <option value="wled">WLED / Relay Controller (Direct WebSocket)</option>
+        </select>
       </div>
-      <div class="field">
-        <label>Ping Interval (sec)</label>
-        <input type="number" id="dm-ping" value="10" min="2" max="300">
-        <div class="hint">How often to request state from the device.</div>
+      <!-- MQTT-only fields -->
+      <div id="dm-mqtt-fields">
+        <div class="field">
+          <label>Topic Prefix</label>
+          <input type="text" id="dm-prefix" placeholder="home/relay">
+          <div class="hint">Must match the prefix in ESP32 firmware config.</div>
+        </div>
+        <div class="field">
+          <label>Ping Interval (sec)</label>
+          <input type="number" id="dm-ping" value="10" min="2" max="300">
+          <div class="hint">How often to request state from the device.</div>
+        </div>
+      </div>
+      <!-- WLED-only fields -->
+      <div id="dm-wled-fields" style="display:none">
+        <div class="field">
+          <label>Device Host / IP</label>
+          <input type="text" id="dm-host" placeholder="192.168.1.x or hostname.local">
+          <div class="hint">Device must be reachable from this browser. Use ws:// for local, wss:// requires TLS on device.</div>
+        </div>
+        <div class="field">
+          <label>Poll Interval (sec, 0 = push only)</label>
+          <input type="number" id="dm-poll" value="0" min="0" max="300">
+          <div class="hint">WLED pushes state on every change. Set 0 to rely on push only.</div>
+        </div>
       </div>
     </div>
     <div class="modal-footer">
