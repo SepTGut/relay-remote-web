@@ -65,8 +65,9 @@ function mqttConnect() {
 
   const clientId = 'relayctrl-' + Math.random().toString(36).slice(2, 9);
 
-  // *** FIX: Paho 1.1.0 uses Paho.MQTT.Client ***
-  client = new Paho.MQTT.Client(host, port, clientId);
+  // Paho namespace differs by CDN build: try Paho.MQTT.Client, fall back to Paho.Client
+  const PahoClient = (Paho.MQTT && Paho.MQTT.Client) ? Paho.MQTT.Client : Paho.Client;
+  client = new PahoClient(host, port, clientId);
 
   client.onConnectionLost = function(resp) {
     connected = false;
@@ -129,7 +130,8 @@ function mqttDisconnect() {
 function publish(topic, payload, retained=false) {
   if (!connected || !client) { toast('Not connected', 'r'); return false; }
   try {
-    const msg = new Paho.MQTT.Message(String(payload));
+    const PahoMessage = (Paho.MQTT && Paho.MQTT.Message) ? Paho.MQTT.Message : Paho.Message;
+    const msg = new PahoMessage(String(payload));
     msg.destinationName = topic;
     msg.retained = retained;
     msg.qos = 1;
