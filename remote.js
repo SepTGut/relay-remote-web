@@ -71,10 +71,14 @@ function mqttConnect() {
   brokerCfg.useSSL = ssl;
   persistAll();
 
-  if (mqttClient && mqttClient.isConnected()) mqttClient.disconnect();
+  if (mqttClient) {
+    try { if (mqttClient.isConnected()) mqttClient.disconnect(); } catch {}
+    mqttClient = null;
+  }
 
   const clientId = 'relayctrl-remote-' + Math.random().toString(36).slice(2, 8);
-  mqttClient = new Paho.Client(host, port, clientId);
+  // Paho 1.1.0: namespace is Paho.MQTT.Client, not Paho.Client
+  mqttClient = new Paho.MQTT.Client(host, port, clientId);
 
   mqttClient.onConnectionLost = (res) => {
     mqttConnected = false;
@@ -83,7 +87,6 @@ function mqttConnect() {
     renderDeviceList();
     if (activeDeviceId) renderDevice(activeDeviceId);
     if (res.errorCode !== 0) toast('MQTT disconnected: ' + res.errorMessage, 'red');
-    // stop pings
     Object.values(pingTimers).forEach(clearInterval);
     pingTimers = {};
   };
@@ -93,9 +96,9 @@ function mqttConnect() {
   const opts = {
     useSSL: ssl,
     keepAliveInterval: 30,
-    reconnect: true,
+    // reconnect not supported in Paho 1.1.0 — omitted
     onSuccess: onConnected,
-    onFailure: (err) => { toast('MQTT connect failed: ' + err.errorMessage, 'red'); setConnUI(false); }
+    onFailure: (err) => { toast('MQTT connect failed: ' + (err.errorMessage || err.errorCode), 'red'); setConnUI(false); }
   };
   if (user) { opts.userName = user; opts.password = pass; }
 
@@ -104,7 +107,10 @@ function mqttConnect() {
 }
 
 function mqttDisconnect() {
-  if (mqttClient && mqttClient.isConnected()) mqttClient.disconnect();
+  if (mqttClient) {
+    try { if (mqttClient.isConnected()) mqttClient.disconnect(); } catch {}
+    mqttClient = null;
+  }
   Object.values(pingTimers).forEach(clearInterval);
   pingTimers = {};
   mqttConnected = false;
@@ -221,7 +227,7 @@ function onMessage(msg) {
    PUBLISH HELPERS
 ══════════════════════════════════════════ */
 function publish(topic, payload, retained = false) {
-  if (!mqttConnected) { toast('Not connected to MQTT', 'red'); return false; }
+  if (!mqttConnected || !mqttClient) { toast('Not connected to MQTT', 'red'); return false; }
   const msg = new Paho.Message(String(payload));
   msg.destinationName = topic;
   msg.retained = retained;
