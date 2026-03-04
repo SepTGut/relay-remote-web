@@ -1,604 +1,549 @@
 /* ═══════════════════════════════════════════════════
    RELAY CTRL — REMOTE DASHBOARD  (remote.js)
-   MQTT over WebSocket (broker must expose WS port)
+   MQTT over WebSocket using Paho 1.1.0
 ═══════════════════════════════════════════════════ */
 
-// ── MQTT lib loaded from CDN in remote.html ──────────
-// Uses Paho MQTT JS client
+/* ── STORAGE ── */
+const SK = 'relayctrl_v1';
+function load() { try { return JSON.parse(localStorage.getItem(SK) || '{}'); } catch { return {}; } }
+function save(d) { localStorage.setItem(SK, JSON.stringify(d)); }
 
-/* ══════════════════════════════════════════
-   PERSISTENCE
-══════════════════════════════════════════ */
-const STORAGE_KEY = 'relayctrl_remote_cfg';
+/* ── STATE ── */
+let client     = null;
+let connected  = false;
+let pingTimers = {};
+let devices    = [];
+let activeId   = null;
 
-function loadStorage() {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch { return {}; }
-}
-function saveStorage(data) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-}
+const stored   = load();
+const broker   = stored.broker   || { host:'', port:9001, user:'', pass:'', ssl:false };
+devices        = (stored.devices || []).map(d => ({ ...d, status:'offline', relays:[] }));
 
-/* ══════════════════════════════════════════
-   STATE
-══════════════════════════════════════════ */
-let mqttClient = null;
-let mqttConnected = false;
-let pingTimers = {};          // deviceId → setInterval handle
+/* ── CLOCK ── */
+setInterval(() => { document.getElementById('clock').textContent = new Date().toTimeString().slice(0,8); }, 1000);
 
-// devices: [ { id, name, prefix, pingInterval, status, lastSeen, relays:[] } ]
-let devices = [];
-let activeDeviceId = null;
-
-const stored = loadStorage();
-const brokerCfg = stored.broker || { host: '', port: 9001, user: '', pass: '', useSSL: false };
-devices = stored.devices || [];
-
-/* ══════════════════════════════════════════
-   CLOCK
-══════════════════════════════════════════ */
-function updateClock() {
-  document.getElementById('clock').textContent = new Date().toTimeString().slice(0, 8);
-}
-setInterval(updateClock, 1000);
-updateClock();
-
-/* ══════════════════════════════════════════
-   TOAST
-══════════════════════════════════════════ */
-let toastTimer;
-function toast(msg, type = '') {
+/* ── TOAST ── */
+let toastT;
+function toast(msg, type='') {
   const el = document.getElementById('toast');
   el.textContent = msg;
-  el.className = 'show' + (type ? ' ' + type : '');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.className = '', 2500);
+  el.className = 'show' + (type ? ' '+type : '');
+  clearTimeout(toastT);
+  toastT = setTimeout(() => el.className = '', 2800);
 }
 
 /* ══════════════════════════════════════════
-   MQTT CONNECTION
+   MQTT
 ══════════════════════════════════════════ */
 function mqttConnect() {
+  // Guard: Paho must be loaded
+  if (typeof Paho === 'undefined') {
+    showError('Paho MQTT library not loaded. Check your internet connection and reload the page.');
+    return;
+  }
+
   const host = document.getElementById('b-host').value.trim();
   const port = parseInt(document.getElementById('b-port').value) || 9001;
   const user = document.getElementById('b-user').value.trim();
   const pass = document.getElementById('b-pass').value;
-  const ssl  = document.getElementById('b-ssl').checked;
+  const ssl  = location.protocol === 'https:' ? true : document.getElementById('b-ssl').checked;
 
-  if (!host) { toast('Enter broker host', 'red'); return; }
+  if (!host) { toast('Enter broker host', 'r'); return; }
+  clearError();
 
-  brokerCfg.host = host; brokerCfg.port = port;
-  brokerCfg.user = user; brokerCfg.pass = pass;
-  brokerCfg.useSSL = ssl;
-  persistAll();
+  // Save broker config
+  broker.host = host; broker.port = port;
+  broker.user = user; broker.pass = pass; broker.ssl = ssl;
+  persist();
 
-  if (mqttClient) {
-    try { if (mqttClient.isConnected()) mqttClient.disconnect(); } catch {}
-    mqttClient = null;
+  // Disconnect any existing client cleanly
+  if (client) {
+    try { client.disconnect(); } catch {}
+    client = null;
   }
+  connected = false;
 
-  const clientId = 'relayctrl-remote-' + Math.random().toString(36).slice(2, 8);
-  // Paho 1.1.0: namespace is Paho.MQTT.Client, not Paho.Client
-  mqttClient = new Paho.MQTT.Client(host, port, clientId);
+  const clientId = 'relayctrl-' + Math.random().toString(36).slice(2, 9);
 
-  mqttClient.onConnectionLost = (res) => {
-    mqttConnected = false;
+  // *** FIX: Paho 1.1.0 uses Paho.MQTT.Client ***
+  client = new Paho.MQTT.Client(host, port, clientId);
+
+  client.onConnectionLost = function(resp) {
+    connected = false;
     setConnUI(false);
     devices.forEach(d => d.status = 'offline');
-    renderDeviceList();
-    if (activeDeviceId) renderDevice(activeDeviceId);
-    if (res.errorCode !== 0) toast('MQTT disconnected: ' + res.errorMessage, 'red');
+    renderSidebar();
+    if (activeId) renderDevice(activeId);
     Object.values(pingTimers).forEach(clearInterval);
     pingTimers = {};
+    if (resp.errorCode !== 0) {
+      toast('Disconnected: ' + resp.errorMessage, 'r');
+      showError('Lost connection: ' + resp.errorMessage);
+    }
   };
 
-  mqttClient.onMessageArrived = onMessage;
+  client.onMessageArrived = onMessage;
 
   const opts = {
     useSSL: ssl,
     keepAliveInterval: 30,
-    // reconnect not supported in Paho 1.1.0 — omitted
-    onSuccess: onConnected,
-    onFailure: (err) => { toast('MQTT connect failed: ' + (err.errorMessage || err.errorCode), 'red'); setConnUI(false); }
+    // *** FIX: no 'reconnect' key — not supported in Paho 1.1.0 ***
+    onSuccess: function() {
+      connected = true;
+      clearError();
+      setConnUI(true);
+      toast('Connected to ' + host, 'g');
+      devices.forEach(d => { subscribeDevice(d); pingDevice(d.id); startPing(d); });
+    },
+    onFailure: function(err) {
+      connected = false;
+      setConnUI(false);
+      const msg = err.errorMessage || ('Error code ' + err.errorCode);
+      toast('Connect failed: ' + msg, 'r');
+      showError('Failed to connect: ' + msg + '\nCheck host, port, credentials, and that the broker has WebSocket enabled.');
+    }
   };
+
   if (user) { opts.userName = user; opts.password = pass; }
 
-  try { mqttClient.connect(opts); }
-  catch (e) { toast('Connect error: ' + e.message, 'red'); }
+  try {
+    client.connect(opts);
+  } catch(e) {
+    toast('Connect error: ' + e.message, 'r');
+    showError(e.message);
+  }
 }
 
 function mqttDisconnect() {
-  if (mqttClient) {
-    try { if (mqttClient.isConnected()) mqttClient.disconnect(); } catch {}
-    mqttClient = null;
-  }
   Object.values(pingTimers).forEach(clearInterval);
   pingTimers = {};
-  mqttConnected = false;
+  devices.forEach(d => publishPresence(d, false));
+  if (client) { try { client.disconnect(); } catch {} client = null; }
+  connected = false;
   setConnUI(false);
   devices.forEach(d => d.status = 'offline');
-  renderDeviceList();
+  renderSidebar();
+  if (activeId) renderDevice(activeId);
 }
 
-function onConnected() {
-  mqttConnected = true;
-  setConnUI(true);
-  toast('MQTT connected', 'green');
+function publish(topic, payload, retained=false) {
+  if (!connected || !client) { toast('Not connected', 'r'); return false; }
+  try {
+    const msg = new Paho.MQTT.Message(String(payload));
+    msg.destinationName = topic;
+    msg.retained = retained;
+    msg.qos = 1;
+    client.send(msg);
+    return true;
+  } catch(e) { toast('Publish error: ' + e.message, 'r'); return false; }
+}
 
-  // Subscribe to all device state topics
-  devices.forEach(d => subscribeDevice(d));
-  // Ping all devices
-  devices.forEach(d => {
-    announcePresence(d, true);
-    schedulePing(d);
-  });
+function publishJSON(topic, obj, retained=false) {
+  return publish(topic, JSON.stringify(obj), retained);
 }
 
 function subscribeDevice(dev) {
-  if (!mqttConnected) return;
-  const p = dev.prefix;
-  mqttClient.subscribe(p + '/state');        // full JSON state dump
-  mqttClient.subscribe(p + '/+/state');      // per-relay state
-  mqttClient.subscribe(p + '/status');       // device LWT
+  if (!connected) return;
+  try {
+    client.subscribe(dev.prefix + '/state');       // full JSON dump
+    client.subscribe(dev.prefix + '/+/state');     // per-relay
+    client.subscribe(dev.prefix + '/status');      // LWT
+  } catch(e) { console.warn('Subscribe error', e); }
 }
 
 function unsubscribeDevice(dev) {
-  if (!mqttConnected) return;
-  const p = dev.prefix;
-  try { mqttClient.unsubscribe(p + '/state'); } catch {}
-  try { mqttClient.unsubscribe(p + '/+/state'); } catch {}
-  try { mqttClient.unsubscribe(p + '/status'); } catch {}
+  if (!connected) return;
+  try { client.unsubscribe(dev.prefix + '/state'); } catch {}
+  try { client.unsubscribe(dev.prefix + '/+/state'); } catch {}
+  try { client.unsubscribe(dev.prefix + '/status'); } catch {}
 }
 
-function announcePresence(dev, online) {
+function publishPresence(dev, online) {
   publish(dev.prefix + '/presence', online ? 'online' : 'offline', false);
 }
 
-function schedulePing(dev) {
+function startPing(dev) {
   if (pingTimers[dev.id]) clearInterval(pingTimers[dev.id]);
   const iv = (dev.pingInterval || 10) * 1000;
-  // immediate ping
-  publish(dev.prefix + '/ping', '1', false);
   pingTimers[dev.id] = setInterval(() => {
-    if (!mqttConnected) return;
-    publish(dev.prefix + '/ping', '1', false);
+    if (connected) publish(dev.prefix + '/ping', '1', false);
   }, iv);
 }
 
-/* ══════════════════════════════════════════
-   INCOMING MESSAGES
-══════════════════════════════════════════ */
+/* ── INCOMING MESSAGES ── */
 function onMessage(msg) {
-  const topic = msg.destinationName;
+  const topic   = msg.destinationName;
   const payload = msg.payloadString;
-
-  // Match device by prefix
-  const dev = devices.find(d => topic.startsWith(d.prefix + '/'));
+  const dev     = devices.find(d => topic.startsWith(d.prefix + '/'));
   if (!dev) return;
 
   const suffix = topic.slice(dev.prefix.length + 1);
 
-  // ── Full JSON state dump ─────────────────────────────
+  // Full JSON state
   if (suffix === 'state') {
     try {
       const data = JSON.parse(payload);
       if (Array.isArray(data.relays)) {
-        dev.relays = data.relays;
-        dev.status = 'online';
+        dev.relays   = data.relays;
+        dev.status   = 'online';
         dev.lastSeen = Date.now();
-        renderDeviceList();
-        if (activeDeviceId === dev.id) renderDevice(dev.id);
+        renderSidebar();
+        if (activeId === dev.id) renderDevice(dev.id);
       }
     } catch {}
     return;
   }
 
-  // ── Device LWT ──────────────────────────────────────
+  // Device LWT
   if (suffix === 'status') {
     const wasOnline = dev.status === 'online';
-    dev.status = payload.trim().toLowerCase() === 'online' ? 'online' : 'offline';
-    if (dev.status === 'online' && !wasOnline) {
-      // freshly online - request full state
-      setTimeout(() => publish(dev.prefix + '/ping', '1', false), 500);
-    }
+    dev.status   = payload.trim().toLowerCase() === 'online' ? 'online' : 'offline';
     dev.lastSeen = Date.now();
-    renderDeviceList();
-    if (activeDeviceId === dev.id) renderDevice(dev.id);
+    if (dev.status === 'online' && !wasOnline)
+      setTimeout(() => publish(dev.prefix + '/ping', '1', false), 400);
+    renderSidebar();
+    if (activeId === dev.id) renderDevice(dev.id);
     return;
   }
 
-  // ── Per-relay state ──────────────────────────────────
-  // {prefix}/{id}/state
+  // Per-relay  {id}/state
   const m = suffix.match(/^(\d+)\/state$/);
   if (m) {
     const id = parseInt(m[1]);
     if (!dev.relays) dev.relays = [];
-    let relay = dev.relays.find(r => r.id === id);
-    if (!relay) { relay = { id, name: 'Relay ' + (id + 1), state: false }; dev.relays.push(relay); dev.relays.sort((a,b) => a.id - b.id); }
-    relay.state = payload.trim().toUpperCase() === 'ON';
-    dev.status = 'online';
+    let r = dev.relays.find(r => r.id === id);
+    if (!r) { r = { id, name:'Relay '+(id+1), state:false }; dev.relays.push(r); dev.relays.sort((a,b)=>a.id-b.id); }
+    r.state      = payload.trim().toUpperCase() === 'ON';
+    dev.status   = 'online';
     dev.lastSeen = Date.now();
-    if (activeDeviceId === dev.id) updateRelayCard(dev, relay);
-    renderDeviceList();
+    if (activeId === dev.id) updateCard(dev, r);
+    renderSidebar();
     return;
   }
 }
 
-/* ══════════════════════════════════════════
-   PUBLISH HELPERS
-══════════════════════════════════════════ */
-function publish(topic, payload, retained = false) {
-  if (!mqttConnected || !mqttClient) { toast('Not connected to MQTT', 'red'); return false; }
-  const msg = new Paho.Message(String(payload));
-  msg.destinationName = topic;
-  msg.retained = retained;
-  msg.qos = 1;
-  try { mqttClient.send(msg); return true; } catch (e) { toast('Publish failed', 'red'); return false; }
-}
-
-function publishJSON(topic, obj, retained = false) {
-  return publish(topic, JSON.stringify(obj), retained);
-}
-
-/* ══════════════════════════════════════════
-   RELAY CONTROL
-══════════════════════════════════════════ */
-function toggleRelay(dev, relayId, on) {
-  // Use JSON payload
+/* ── RELAY CONTROL ── */
+function toggleRelay(devId, relayId, on) {
+  const dev = getDevice(devId);
+  if (!dev) return;
   publishJSON(dev.prefix + '/' + relayId + '/set', { state: on });
-  // Optimistic update
   const r = dev.relays?.find(r => r.id === relayId);
-  if (r) { r.state = on; updateRelayCard(dev, r); updateDeviceHeader(dev); }
+  if (r) { r.state = on; updateCard(dev, r); updateMeta(dev); }
 }
 
-function pulseRelay(dev, relayId, ms) {
+function pulseRelay(devId, relayId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const ms = parseInt(document.getElementById('pm-'+devId+'-'+relayId).value) || 500;
   publishJSON(dev.prefix + '/' + relayId + '/set', { pulse: ms });
-  toast('Pulse ' + ms + 'ms → ' + dev.name + ' R' + (relayId + 1));
+  toast('Pulse '+ms+'ms → '+dev.name+' R'+(relayId+1));
 }
 
-function timerRelay(dev, relayId, sec) {
-  publishJSON(dev.prefix + '/' + relayId + '/set', { timer: sec });
-  toast('Timer ' + sec + 's → ' + dev.name + ' R' + (relayId + 1));
+function timerRelay(devId, relayId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const s = parseInt(document.getElementById('ts-'+devId+'-'+relayId).value) || 30;
+  publishJSON(dev.prefix + '/' + relayId + '/set', { timer: s });
+  toast('Timer '+s+'s → '+dev.name+' R'+(relayId+1));
 }
 
-function allOff(dev) {
+function allOff(devId) {
+  const dev = getDevice(devId); if (!dev) return;
   publish(dev.prefix + '/alloff', '1');
-  if (dev.relays) dev.relays.forEach(r => { r.state = false; updateRelayCard(dev, r); });
-  updateDeviceHeader(dev);
-  toast('All OFF — ' + dev.name, 'red');
+  dev.relays?.forEach(r => { r.state = false; updateCard(dev, r); });
+  updateMeta(dev);
+  toast('All OFF — '+dev.name, 'r');
 }
 
-function allOn(dev) {
+function allOn(devId) {
+  const dev = getDevice(devId); if (!dev) return;
   publish(dev.prefix + '/allon', '1');
-  if (dev.relays) dev.relays.forEach(r => { r.state = true; updateRelayCard(dev, r); });
-  updateDeviceHeader(dev);
-  toast('All ON — ' + dev.name, 'amber');
+  dev.relays?.forEach(r => { r.state = true; updateCard(dev, r); });
+  updateMeta(dev);
+  toast('All ON — '+dev.name);
 }
 
-/* ── Global JSON/CMD publish ── */
-function sendCmd(dev, jsonStr) {
-  try {
-    const obj = JSON.parse(jsonStr);
-    publish(dev.prefix + '/cmd', JSON.stringify(obj), false);
-    toast('CMD sent', 'green');
-  } catch (e) { toast('Invalid JSON: ' + e.message, 'red'); }
+function sendCmd(devId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const raw = document.getElementById('cmd-'+devId).value.trim();
+  if (!raw) return;
+  try { JSON.parse(raw); } catch(e) { toast('Invalid JSON: '+e.message, 'r'); return; }
+  publish(dev.prefix + '/cmd', raw);
+  toast('Sent', 'g');
 }
 
-/* ══════════════════════════════════════════
-   UI — CONN STATUS
-══════════════════════════════════════════ */
-function setConnUI(connected) {
-  const dot   = document.getElementById('conn-dot');
-  const label = document.getElementById('conn-label');
-  const btnC  = document.getElementById('btn-connect');
-  const btnD  = document.getElementById('btn-disconnect');
-  const tbS   = document.getElementById('tb-status');
-  dot.className   = 'conn-dot' + (connected ? ' online' : '');
-  label.textContent = connected ? 'online' : 'offline';
-  tbS.textContent   = connected ? 'CONNECTED' : 'DISCONNECTED';
-  tbS.className     = 'tb-val ' + (connected ? 'green' : 'red');
-  btnC.style.display = connected ? 'none' : '';
-  btnD.style.display = connected ? '' : 'none';
+function pingDevice(id) {
+  const dev = getDevice(id); if (!dev) return;
+  publish(dev.prefix + '/ping', '1', false);
 }
 
 /* ══════════════════════════════════════════
-   UI — DEVICE LIST (SIDEBAR)
+   UI
 ══════════════════════════════════════════ */
-function renderDeviceList() {
+function setConnUI(on) {
+  document.getElementById('conn-dot').className   = 'cdot' + (on?' on':'');
+  document.getElementById('conn-label').textContent = on ? 'online' : 'offline';
+  const ts = document.getElementById('tb-status');
+  ts.textContent = on ? 'CONNECTED' : 'DISCONNECTED';
+  ts.className   = 'tb-val ' + (on ? 'g' : 'r');
+  document.getElementById('btn-connect').style.display    = on ? 'none' : '';
+  document.getElementById('btn-disconnect').style.display = on ? '' : 'none';
+}
+
+function showError(msg) {
+  const el = document.getElementById('conn-error');
+  el.textContent = msg; el.style.display = 'block';
+}
+function clearError() {
+  const el = document.getElementById('conn-error');
+  el.textContent = ''; el.style.display = 'none';
+}
+
+function renderSidebar() {
   const list = document.getElementById('device-list');
   list.innerHTML = '';
   if (!devices.length) {
-    list.innerHTML = '<div style="padding:14px 16px;font-size:10px;color:var(--dim)">No devices added yet.</div>';
+    list.innerHTML = '<div style="padding:12px 14px;font-size:10px;color:var(--dim)">No devices yet.</div>';
   }
   devices.forEach(dev => {
-    const item = document.createElement('div');
-    item.className = 'device-item' + (dev.id === activeDeviceId ? ' active' : '');
-    item.innerHTML = `
-      <div class="device-item-left">
-        <span class="device-dot ${dev.status || 'offline'}"></span>
-        <span class="device-name">${dev.name}</span>
+    const el = document.createElement('div');
+    el.className = 'device-item' + (dev.id === activeId ? ' active' : '');
+    el.innerHTML = `
+      <div class="dev-left">
+        <span class="dev-dot ${dev.status||'offline'}"></span>
+        <span class="dev-name">${esc(dev.name)}</span>
       </div>
-      <button class="device-remove" onclick="removeDevice('${dev.id}',event)" title="Remove">✕</button>`;
-    item.onclick = (e) => { if (e.target.closest('.device-remove')) return; selectDevice(dev.id); };
-    list.appendChild(item);
+      <button class="dev-remove" onclick="removeDevice('${dev.id}',event)">✕</button>`;
+    el.onclick = e => { if (e.target.closest('.dev-remove')) return; selectDevice(dev.id); };
+    list.appendChild(el);
   });
-  // topbar device count
   const el = document.getElementById('tb-devices');
   if (el) el.textContent = devices.length;
 }
 
 function selectDevice(id) {
-  activeDeviceId = id;
-  renderDeviceList();
+  activeId = id;
+  renderSidebar();
   renderDevice(id);
 }
 
-/* ══════════════════════════════════════════
-   UI — DEVICE MAIN VIEW
-══════════════════════════════════════════ */
 function renderDevice(id) {
   const main = document.getElementById('main');
-  const dev = devices.find(d => d.id === id);
-  if (!dev) { main.innerHTML = noDeviceHTML(); return; }
+  const dev  = getDevice(id);
+  if (!dev) { main.innerHTML = emptyHTML('📡','No Device Selected','Add a device in the sidebar and connect to your broker.'); return; }
 
-  const relays = dev.relays || [];
-  const online = dev.status === 'online';
-  const activeCount = relays.filter(r => r.state).length;
+  const relays  = dev.relays || [];
+  const online  = dev.status === 'online';
+  const active  = relays.filter(r => r.state).length;
 
   main.innerHTML = `
-    <div class="device-view-header">
+    <div class="dev-header">
       <div>
-        <div class="device-view-title">${dev.name} <span class="sub">${dev.prefix}</span></div>
-        <div class="device-meta" style="margin-top:6px">
-          <span class="pill ${online ? 'pill-green' : 'pill-red'}">${online ? 'ONLINE' : 'OFFLINE'}</span>
-          <span class="pill pill-amber">${relays.length} relays</span>
-          <span class="pill ${activeCount > 0 ? 'pill-amber' : 'pill-dim'}">${activeCount} active</span>
-          ${dev.lastSeen ? `<span class="last-seen">seen ${fmtAgo(dev.lastSeen)}</span>` : ''}
+        <div class="dev-title">${esc(dev.name)}<span class="sub">${esc(dev.prefix)}</span></div>
+        <div class="dev-meta">
+          <span class="pill ${online?'pill-g':'pill-r'}" id="pill-status-${dev.id}">${online?'ONLINE':'OFFLINE'}</span>
+          <span class="pill pill-a" id="pill-count-${dev.id}">${relays.length} relays</span>
+          <span class="pill ${active>0?'pill-a':'pill-d'}" id="pill-active-${dev.id}">${active} active</span>
+          <span class="last-seen" id="last-seen-${dev.id}">${dev.lastSeen?'seen '+ago(dev.lastSeen):''}</span>
         </div>
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn btn-ghost btn-sm" onclick="pingDevice('${dev.id}')">↻ Ping</button>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start">
+        <button class="btn btn-ghost btn-sm" onclick="pingDevice('${dev.id}');toast('Ping sent')">↻ Ping</button>
         <button class="btn btn-ghost btn-sm" onclick="openEditDevice('${dev.id}')">✎ Edit</button>
-        <button class="btn btn-red btn-sm" onclick="allOff(getDevice('${dev.id}'))">⬛ All Off</button>
-        <button class="btn btn-amber btn-sm" onclick="allOn(getDevice('${dev.id}'))">⬛ All On</button>
+        <button class="btn btn-red btn-sm" onclick="allOff('${dev.id}')">⬛ All Off</button>
+        <button class="btn btn-amber btn-sm" onclick="allOn('${dev.id}')">■ All On</button>
       </div>
     </div>
 
-    <!-- Global CMD bar -->
     <div class="cmd-bar">
-      <span class="cmd-bar-label">CMD</span>
-      <input class="cmd-input" id="cmd-input" placeholder='{"id":0,"state":true}  or  {"id":"all","state":false}' onkeydown="if(event.key==='Enter')sendCmdActive()">
-      <button class="btn btn-teal btn-sm" onclick="sendCmdActive()">Send JSON</button>
-      <div class="cmd-hint">
+      <div class="cmd-row">
+        <span class="cmd-lbl">JSON CMD</span>
+        <input class="cmd-input" id="cmd-${dev.id}" placeholder='{"id":0,"state":true}  ·  {"id":"all","state":false}'
+          onkeydown="if(event.key==='Enter')sendCmd('${dev.id}')">
+        <button class="btn btn-teal btn-sm" onclick="sendCmd('${dev.id}')">Send</button>
+      </div>
+      <div class="cmd-hints">
         Single: <code>{"id":0,"state":true}</code> ·
         All: <code>{"id":"all","state":false}</code> ·
-        Pulse: <code>{"id":2,"pulse":500}</code> ·
-        Array: <code>[{"id":0,"state":true},{"id":1,"timer":30}]</code>
+        Pulse: <code>{"id":1,"pulse":500}</code> ·
+        Timer: <code>{"id":2,"timer":30}</code> ·
+        Array: <code>[{"id":0,"state":true},{"id":1,"pulse":500}]</code>
       </div>
     </div>
 
-    <!-- Relay grid -->
-    <div class="relay-grid" id="relay-grid-${dev.id}">
-      ${relays.length ? relays.map(r => relayCardHTML(dev, r)).join('') : emptyRelaysHTML()}
-    </div>
-  `;
+    <div class="relay-grid" id="grid-${dev.id}">
+      ${relays.length ? relays.map(r => cardHTML(dev, r)).join('') : emptyHTML('🔌','No relay data yet','Make sure the device is online.<br>Click ↻ Ping to request state.')}
+    </div>`;
 }
 
-function updateDeviceHeader(dev) {
-  // lightweight refresh of just the pills
-  if (activeDeviceId !== dev.id) return;
-  const relays = dev.relays || [];
-  const activeCount = relays.filter(r => r.state).length;
-  const pills = document.querySelectorAll('.device-meta .pill');
-  if (pills[1]) pills[1].textContent = relays.length + ' relays';
-  if (pills[2]) { pills[2].textContent = activeCount + ' active'; pills[2].className = 'pill ' + (activeCount > 0 ? 'pill-amber' : 'pill-dim'); }
-}
-
-function relayCardHTML(dev, r) {
+function cardHTML(dev, r) {
+  const did = dev.id, rid = r.id;
   return `
-    <div class="relay-card ${r.state ? 'on' : ''}" id="rcard-${dev.id}-${r.id}">
+    <div class="rcard ${r.state?'on':''}" id="rcard-${did}-${rid}">
       <div class="rc-head">
         <div class="rc-left">
-          <span class="rc-num">${String(r.id + 1).padStart(2, '0')}</span>
-          <span class="rc-name">${r.name || 'Relay ' + (r.id + 1)}</span>
+          <span class="rc-num">${String(rid+1).padStart(2,'0')}</span>
+          <span class="rc-name">${esc(r.name||'Relay '+(rid+1))}</span>
         </div>
         <div class="rc-right">
-          <span class="state-pill ${r.state ? 'on' : 'off'}" id="rsp-${dev.id}-${r.id}">${r.state ? 'ON' : 'OFF'}</span>
-          <label class="ind-toggle">
-            <input type="checkbox" ${r.state ? 'checked' : ''} onchange="toggleRelay(getDevice('${dev.id}'),${r.id},this.checked)">
-            <div class="ind-track"><div class="ind-thumb"></div></div>
+          <span class="spill ${r.state?'on':'off'}" id="rsp-${did}-${rid}">${r.state?'ON':'OFF'}</span>
+          <label class="itoggle">
+            <input type="checkbox" ${r.state?'checked':''} onchange="toggleRelay('${did}',${rid},this.checked)">
+            <div class="itrack"><div class="ithumb"></div></div>
           </label>
         </div>
       </div>
       <div class="rc-body">
         <div class="rc-actions">
           <div class="act-group">
-            <input class="act-num-input" id="pm-${dev.id}-${r.id}" value="500" title="ms">
-            <button class="act-exec" onclick="pulseRelay(getDevice('${dev.id}'),${r.id},parseInt(document.getElementById('pm-${dev.id}-${r.id}').value)||500)">Pulse</button>
+            <input class="act-input" id="pm-${did}-${rid}" value="500" title="ms">
+            <button class="act-btn" onclick="pulseRelay('${did}',${rid})">Pulse</button>
           </div>
           <div class="act-group">
-            <input class="act-num-input" id="ts-${dev.id}-${r.id}" value="30" title="sec">
-            <button class="act-exec" onclick="timerRelay(getDevice('${dev.id}'),${r.id},parseInt(document.getElementById('ts-${dev.id}-${r.id}').value)||30)">Timer</button>
+            <input class="act-input" id="ts-${did}-${rid}" value="30" title="sec">
+            <button class="act-btn" onclick="timerRelay('${did}',${rid})">Timer</button>
           </div>
-          <span class="timer-badge${r.timer > 0 ? ' visible' : ''}" id="tbadge-${dev.id}-${r.id}">${r.timer > 0 ? r.timer + 's' : ''}</span>
+          <span class="timer-badge ${r.timer>0?'v':''}" id="tbadge-${did}-${rid}">${r.timer>0?r.timer+'s':''}</span>
         </div>
       </div>
     </div>`;
 }
 
-function updateRelayCard(dev, r) {
-  const card = document.getElementById(`rcard-${dev.id}-${r.id}`);
+function updateCard(dev, r) {
+  const card = document.getElementById('rcard-'+dev.id+'-'+r.id);
   if (!card) return;
-  card.className = 'relay-card' + (r.state ? ' on' : '');
+  card.className = 'rcard' + (r.state?' on':'');
   const cb = card.querySelector('input[type=checkbox]');
   if (cb) cb.checked = r.state;
-  const sp = document.getElementById(`rsp-${dev.id}-${r.id}`);
-  if (sp) { sp.textContent = r.state ? 'ON' : 'OFF'; sp.className = 'state-pill ' + (r.state ? 'on' : 'off'); }
+  const sp = document.getElementById('rsp-'+dev.id+'-'+r.id);
+  if (sp) { sp.textContent = r.state?'ON':'OFF'; sp.className = 'spill '+(r.state?'on':'off'); }
 }
 
-function emptyRelaysHTML() {
-  return `<div class="empty-state" style="padding:40px 20px">
-    <div class="empty-icon">🔌</div>
-    <div class="empty-title">No relay data yet</div>
-    <div class="empty-sub">Make sure the device is online and MQTT is configured.<br>Click ↻ Ping to request current state.</div>
-  </div>`;
+function updateMeta(dev) {
+  if (activeId !== dev.id) return;
+  const relays = dev.relays || [];
+  const active = relays.filter(r => r.state).length;
+  const pa = document.getElementById('pill-active-'+dev.id);
+  if (pa) { pa.textContent = active+' active'; pa.className = 'pill '+(active>0?'pill-a':'pill-d'); }
 }
 
-function noDeviceHTML() {
-  return `<div class="empty-state">
-    <div class="empty-icon">📡</div>
-    <div class="empty-title">No Device Selected</div>
-    <div class="empty-sub">Add a device in the sidebar and connect to your MQTT broker.<br>Each device needs a topic prefix matching its firmware config.</div>
-  </div>`;
-}
-
-/* ══════════════════════════════════════════
-   DEVICE MANAGEMENT
-══════════════════════════════════════════ */
+/* ── DEVICE MANAGEMENT ── */
 function getDevice(id) { return devices.find(d => d.id === id); }
 
 function openAddDevice() {
-  document.getElementById('add-modal-title').textContent = 'Add Device';
-  document.getElementById('dm-id').value = '';
-  document.getElementById('dm-name').value = '';
+  document.getElementById('modal-title').textContent = 'Add Device';
+  document.getElementById('dm-id').value     = '';
+  document.getElementById('dm-name').value   = '';
   document.getElementById('dm-prefix').value = '';
-  document.getElementById('dm-ping').value = '10';
+  document.getElementById('dm-ping').value   = '10';
   document.getElementById('add-modal').classList.add('open');
-  document.getElementById('dm-name').focus();
+  setTimeout(() => document.getElementById('dm-name').focus(), 100);
 }
 
 function openEditDevice(id) {
-  const dev = getDevice(id);
-  if (!dev) return;
-  document.getElementById('add-modal-title').textContent = 'Edit Device';
-  document.getElementById('dm-id').value = dev.id;
-  document.getElementById('dm-name').value = dev.name;
+  const dev = getDevice(id); if (!dev) return;
+  document.getElementById('modal-title').textContent = 'Edit Device';
+  document.getElementById('dm-id').value     = dev.id;
+  document.getElementById('dm-name').value   = dev.name;
   document.getElementById('dm-prefix').value = dev.prefix;
-  document.getElementById('dm-ping').value = dev.pingInterval || 10;
+  document.getElementById('dm-ping').value   = dev.pingInterval || 10;
   document.getElementById('add-modal').classList.add('open');
 }
 
-function closeAddModal() { document.getElementById('add-modal').classList.remove('open'); }
+function closeModal() { document.getElementById('add-modal').classList.remove('open'); }
 
 function saveDevice() {
   const existingId = document.getElementById('dm-id').value;
-  const name   = document.getElementById('dm-name').value.trim() || 'Device';
-  const prefix = document.getElementById('dm-prefix').value.trim().replace(/\/+$/, '') || 'home/relay';
+  const name   = document.getElementById('dm-name').value.trim()   || 'Device';
+  const prefix = document.getElementById('dm-prefix').value.trim().replace(/\/+$/,'') || 'home/relay';
   const ping   = parseInt(document.getElementById('dm-ping').value) || 10;
 
   if (existingId) {
-    // Edit
     const dev = getDevice(existingId);
     if (dev) {
       unsubscribeDevice(dev);
       dev.name = name; dev.prefix = prefix; dev.pingInterval = ping;
-      subscribeDevice(dev);
-      if (pingTimers[dev.id]) { clearInterval(pingTimers[dev.id]); schedulePing(dev); }
+      if (connected) { subscribeDevice(dev); }
+      if (pingTimers[dev.id]) { clearInterval(pingTimers[dev.id]); if (connected) startPing(dev); }
     }
   } else {
-    // Add
-    const dev = {
-      id: 'dev-' + Date.now(),
-      name, prefix, pingInterval: ping,
-      status: 'offline', lastSeen: null, relays: []
-    };
+    const dev = { id:'dev-'+Date.now(), name, prefix, pingInterval:ping, status:'offline', lastSeen:null, relays:[] };
     devices.push(dev);
-    subscribeDevice(dev);
-    if (mqttConnected) { announcePresence(dev, true); schedulePing(dev); }
+    if (connected) { subscribeDevice(dev); publishPresence(dev, true); startPing(dev); }
     selectDevice(dev.id);
   }
 
-  persistAll();
-  renderDeviceList();
-  closeAddModal();
-  toast('Device saved', 'green');
+  persist();
+  renderSidebar();
+  closeModal();
+  toast('Saved', 'g');
 }
 
-function removeDevice(id, event) {
-  if (event) event.stopPropagation();
-  const dev = getDevice(id);
-  if (!dev) return;
-  if (!confirm(`Remove "${dev.name}"?`)) return;
+function removeDevice(id, e) {
+  if (e) e.stopPropagation();
+  const dev = getDevice(id); if (!dev) return;
+  if (!confirm('Remove "'+dev.name+'"?')) return;
   unsubscribeDevice(dev);
-  announcePresence(dev, false);
+  publishPresence(dev, false);
   if (pingTimers[id]) { clearInterval(pingTimers[id]); delete pingTimers[id]; }
   devices = devices.filter(d => d.id !== id);
-  if (activeDeviceId === id) {
-    activeDeviceId = devices[0]?.id || null;
-  }
-  persistAll();
-  renderDeviceList();
-  if (activeDeviceId) renderDevice(activeDeviceId);
-  else document.getElementById('main').innerHTML = noDeviceHTML();
+  if (activeId === id) activeId = devices[0]?.id || null;
+  persist();
+  renderSidebar();
+  if (activeId) renderDevice(activeId);
+  else document.getElementById('main').innerHTML = emptyHTML('📡','No Device Selected','Add a device in the sidebar.');
 }
 
-function pingDevice(id) {
-  const dev = getDevice(id);
-  if (!dev) return;
-  publish(dev.prefix + '/ping', '1', false);
-  toast('Ping sent → ' + dev.name);
+/* ── HELPERS ── */
+function persist() {
+  save({ broker, devices: devices.map(({id,name,prefix,pingInterval}) => ({id,name,prefix,pingInterval})) });
 }
 
-/* ══════════════════════════════════════════
-   ACTIVE DEVICE SHORTCUTS
-══════════════════════════════════════════ */
-function sendCmdActive() {
-  const dev = getDevice(activeDeviceId);
-  if (!dev) { toast('No device selected', 'red'); return; }
-  const input = document.getElementById('cmd-input');
-  sendCmd(dev, input.value);
-}
-
-/* ══════════════════════════════════════════
-   PERSISTENCE
-══════════════════════════════════════════ */
-function persistAll() {
-  saveStorage({
-    broker: brokerCfg,
-    devices: devices.map(d => ({
-      id: d.id, name: d.name, prefix: d.prefix,
-      pingInterval: d.pingInterval
-    }))
-  });
-}
-
-/* ══════════════════════════════════════════
-   UTILS
-══════════════════════════════════════════ */
-function fmtAgo(ts) {
-  const s = Math.floor((Date.now() - ts) / 1000);
+function ago(ts) {
+  const s = Math.floor((Date.now()-ts)/1000);
   if (s < 5)  return 'just now';
-  if (s < 60) return s + 's ago';
-  return Math.floor(s / 60) + 'm ago';
+  if (s < 60) return s+'s ago';
+  return Math.floor(s/60)+'m ago';
 }
 
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function emptyHTML(icon, title, sub) {
+  return `<div class="empty"><div class="empty-icon">${icon}</div><div class="empty-title">${title}</div><div class="empty-sub">${sub}</div></div>`;
+}
+
+// Refresh "last seen X ago" labels every 10s
 setInterval(() => {
-  if (activeDeviceId) {
-    const el = document.querySelector('.last-seen');
-    const dev = getDevice(activeDeviceId);
-    if (el && dev?.lastSeen) el.textContent = 'seen ' + fmtAgo(dev.lastSeen);
-  }
-}, 5000);
+  devices.forEach(dev => {
+    const el = document.getElementById('last-seen-'+dev.id);
+    if (el && dev.lastSeen) el.textContent = 'seen '+ago(dev.lastSeen);
+  });
+}, 10000);
 
-/* ══════════════════════════════════════════
-   INIT
-══════════════════════════════════════════ */
+/* ── INIT ── */
 (function init() {
-  // Restore broker fields
-  document.getElementById('b-host').value  = brokerCfg.host || '';
-  document.getElementById('b-port').value  = brokerCfg.port || 9001;
-  document.getElementById('b-user').value  = brokerCfg.user || '';
-  document.getElementById('b-pass').value  = brokerCfg.pass || '';
-  document.getElementById('b-ssl').checked = brokerCfg.useSSL || false;
+  // If hosted on HTTPS (e.g. GitHub Pages), WSS is required — force it
+  const mustSSL = location.protocol === 'https:';
 
-  renderDeviceList();
-  setConnUI(false);
+  document.getElementById('b-host').value  = broker.host || '';
+  document.getElementById('b-port').value  = broker.port || (mustSSL ? 8084 : 9001);
+  document.getElementById('b-user').value  = broker.user || '';
+  document.getElementById('b-pass').value  = broker.pass || '';
+  document.getElementById('b-ssl').checked = mustSSL || broker.ssl || false;
 
-  if (activeDeviceId === null && devices.length > 0) activeDeviceId = devices[0].id;
-  if (activeDeviceId) renderDevice(activeDeviceId);
-  else document.getElementById('main').innerHTML = noDeviceHTML();
-
-  // Auto-connect if broker was saved
-  if (brokerCfg.host) {
-    setTimeout(mqttConnect, 300);
+  if (mustSSL) {
+    // Lock the TLS checkbox and show a note
+    document.getElementById('b-ssl').disabled = true;
+    const note = document.createElement('div');
+    note.style.cssText = 'font-size:9px;color:var(--amber);margin-top:6px;line-height:1.6';
+    note.innerHTML = '⚠ Page is served over HTTPS — TLS/WSS is required.<br>Broker must support <b>wss://</b> (port 8084 for EMQX/HiveMQ, 8083 for Mosquitto+TLS).';
+    document.getElementById('b-ssl').closest('.broker-panel').appendChild(note);
   }
+
+  setConnUI(false);
+  renderSidebar();
+
+  if (!activeId && devices.length) activeId = devices[0].id;
+  if (activeId) renderDevice(activeId);
+  else document.getElementById('main').innerHTML = emptyHTML('📡','No Device Selected','Connect to your MQTT broker,<br>then add a device using + Add Device.');
 })();

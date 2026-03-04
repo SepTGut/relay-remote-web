@@ -1,6 +1,78 @@
 # Relay Ctrl — Remote Web Dashboard
 
-Standalone web dashboard for controlling ESP32 relay controllers remotely over MQTT via WebSocket.
+## ⚠ GitHub Pages / HTTPS — WSS Required
+
+GitHub Pages serves over **HTTPS**. Browsers block plain WebSocket (`ws://`) from HTTPS pages (mixed content). Your MQTT broker **must support `wss://`** (WebSocket over TLS).
+
+The page auto-detects HTTPS and forces TLS on — you just need the right port.
+
+| Broker | WSS Port |
+|---|---|
+| EMQX (cloud/local) | 8084 |
+| HiveMQ Cloud | 8884 |
+| Mosquitto (self-hosted + TLS) | 8081 or 8884 |
+| HiveMQ Public Broker (`broker.hivemq.com`) | 8884 |
+| test.mosquitto.org | 8081 |
+
+**Easiest option for testing:** use `broker.hivemq.com` port `8884` — it's free, public, no signup.
+
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `index.html` | Page shell |
+| `remote.css` | Styles |
+| `remote.js` | All logic |
+| `README.md` | This file |
+
+## Setup
+
+1. Push all files to a GitHub repo, enable Pages (Settings → Pages → main branch / root).
+2. Open your Pages URL.
+3. Enter broker host + WSS port, click **Connect**.
+4. Click **+ Add Device**, enter a name and the topic prefix matching your ESP32 config (default `home/relay`).
+
+## Broker — Mosquitto self-hosted (WSS)
+
+`mosquitto.conf`:
+```
+listener 1883
+listener 8884
+protocol websockets
+cafile   /etc/mosquitto/certs/ca.crt
+certfile /etc/mosquitto/certs/server.crt
+keyfile  /etc/mosquitto/certs/server.key
+```
+
+## MQTT Topics
+
+### ESP32 → Remote
+| Topic | Payload |
+|---|---|
+| `{prefix}/state` | Full JSON state (retained) |
+| `{prefix}/{id}/state` | `ON` / `OFF` (retained) |
+| `{prefix}/status` | `online` / `offline` (LWT) |
+
+### Remote → ESP32
+| Topic | Payload |
+|---|---|
+| `{prefix}/ping` | `1` — request full state |
+| `{prefix}/presence` | `online` / `offline` |
+| `{prefix}/cmd` | JSON command (see below) |
+| `{prefix}/alloff` · `{prefix}/allon` | `1` |
+| `{prefix}/{id}/set` | `ON`/`OFF`/`TOGGLE` or JSON |
+
+### JSON Command Examples
+```json
+{"id": 0, "state": true}
+{"id": "all", "state": false}
+{"id": 2, "pulse": 500}
+{"id": 1, "timer": 30}
+[{"id":0,"state":true}, {"id":1,"pulse":1000}]
+```
+
 
 ## Files
 
