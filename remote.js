@@ -393,16 +393,17 @@ function renderDevice(id) {
 
     <div class="cmd-bar">
       <div class="cmd-row">
-        <span class="cmd-lbl">JSON CMD</span>
+        <span class="cmd-lbl">${isWled(dev) ? 'CMD' : 'JSON CMD'}</span>
         <input class="cmd-input" id="cmd-${dev.id}"
-          placeholder='${isWled(dev) ? '{"on":true}  ·  {"bri":128}  ·  {"seg":[{"id":0,"fx":73}]}' : '{"on":true}  ·  {"relay":0,"on":true}'}'
+          placeholder='${isWled(dev) ? (!IS_HTTPS ? '{"bri":128}  ·  FX=73&SX=128  ·  ON' : '{"bri":128}  ·  ON  ·  T') : '{"on":true}  ·  {"relay":0,"on":true}'}'
           onkeydown="if(event.key==='Enter')sendCmd('${dev.id}')">
         <button class="btn btn-teal btn-sm" onclick="sendCmd('${dev.id}')">Send</button>
       </div>
       <div class="cmd-hints">
         ${isWled(dev) ?
-          `LED: <code>{"on":true}</code> · <code>{"bri":128}</code> · <code>{"seg":[{"id":0,"fx":73}]}</code><br>
-          Relay: use card toggles below ${IS_HTTPS && !connected ? '— connect to broker first' : ''}` :
+          `JSON → /api: <code>{"on":true}</code> · <code>{"bri":200}</code> · <code>{"seg":[{"id":0,"fx":73,"sx":128}]}</code><br>
+          ${!IS_HTTPS ? `HTTP → /win: <code>FX=73</code> · <code>A=200</code> · <code>SX=128</code> · <code>T=1&SS=2</code><br>` : ''}
+          Plain → root topic: <code>ON</code> · <code>OFF</code> · <code>T</code> · <code>128</code>` :
           `All: <code>{"on":true}</code> · <code>{"on":false}</code> · Toggle: <code>{"on":"t"}</code><br>
           Single: <code>{"relay":0,"on":true}</code> · Pulse: <code>{"relay":1,"pulse":500}</code>`
         }
@@ -412,6 +413,32 @@ function renderDevice(id) {
     <div class="relay-grid" id="grid-${dev.id}">
       ${relays.length ? relays.map(r => cardHTML(dev, r)).join('') : emptyHTML('🔌','No data yet', online ? 'Click ↻ Ping to request state.' : (isWled(dev) && IS_HTTPS ? 'HTTPS blocks WebSocket.' : 'Device is offline.'))}
     </div>
+
+    ${isWled(dev) && dev.hasMultiRelay ? `
+    <div class="pattern-section" id="psec-${dev.id}">
+      <div class="pattern-head">
+        <span class="pattern-title">⟳ Relay Pattern</span>
+        <span class="pattern-status" id="pstatus-${dev.id}"></span>
+        <div style="display:flex;gap:6px;margin-left:auto">
+          <button class="btn btn-teal btn-sm" onclick="wledPatternAddStep('${dev.id}')">+ Step</button>
+          <button class="btn btn-amber btn-sm" id="pbtn-${dev.id}" onclick="wledPatternToggle('${dev.id}')">▶ Run</button>
+          <button class="btn btn-red btn-sm" onclick="wledPatternClear('${dev.id}')">✕ Clear</button>
+        </div>
+      </div>
+      <div class="pattern-meta-row">
+        <span class="wg-lbl">REPEAT</span>
+        <select id="prep-${dev.id}" class="field-select" style="width:90px">
+          <option value="-1">∞ Loop</option>
+          <option value="1">1×</option>
+          <option value="2">2×</option>
+          <option value="5">5×</option>
+          <option value="10">10×</option>
+        </select>
+      </div>
+      <div class="pattern-steps" id="psteps-${dev.id}">
+        <div class="pattern-empty">No steps yet — click <b>+ Step</b> to add one.</div>
+      </div>
+    </div>` : ''}
 
     ${!isWled(dev) && sensors.length ? `
     <div class="sensor-section">
@@ -599,9 +626,8 @@ function wledMqttSubscribe(dev) {
     client.subscribe(t + '/relay/+/state'); // MultiRelay per-relay state
     client.subscribe(t + '/status');        // LWT
   } catch(e) { console.warn('[WLED MQTT] subscribe err', e); }
-  // Trigger WLED to publish /g /c /v by requesting current brightness via root topic.
-  // Publishing the current bri (or 255 as safe default) causes WLED to re-publish state.
-  const bri = dev.wledState?.bri ?? 255;
+  // Trigger WLED to re-publish /g /c /v by publishing current (non-zero) brightness.
+  const bri = dev.wledState?.bri > 0 ? dev.wledState.bri : 255;
   publish(t, String(bri), false);
 }
 
@@ -731,8 +757,10 @@ function wledRequestState(dev) {
     else { toast('Reconnecting…'); wledConnect(dev); }
     toast('↻ Refreshing…');
   } else if (dev.wledTopic && connected) {
-    // Publishing bri to root topic causes WLED to re-publish /g /c /v
-    publish(dev.wledTopic, String(dev.wledState?.bri ?? 255), false);
+    // Publishing current bri (or 255 if unknown) triggers WLED to re-publish /g /c /v
+    // We use the last known non-zero bri — avoids accidentally turning off the light
+    const bri = dev.wledState?.bri > 0 ? dev.wledState.bri : 255;
+    publish(dev.wledTopic, String(bri), false);
     toast('↻ Pinged via MQTT');
   } else if (!connected) {
     toast('Connect to MQTT broker first', 'r');
@@ -816,6 +844,7 @@ function handleWledState(dev, data) {
 }
 
 /* ─── LED controls (WebSocket JSON, both modes can send these) ─── */
+// Send JSON state to WLED  →  WebSocket on HTTP, /api on HTTPS/MQTT
 function wledSend(dev, obj) {
   if (!IS_HTTPS) {
     const ws = wledSockets[dev.id];
@@ -828,17 +857,32 @@ function wledSend(dev, obj) {
   }
 }
 
+// Send a simple string command to WLED root topic  →  "ON" / "OFF" / "T" / "0"-"255"
+function wledCmd(dev, cmd) {
+  if (!IS_HTTPS) {
+    // On HTTP: translate to JSON and send over WebSocket
+    const obj = cmd === 'ON' ? { on: true } : cmd === 'OFF' ? { on: false } : cmd === 'T' ? { on: 'toggle' } : { bri: parseInt(cmd) };
+    return wledSend(dev, obj);
+  } else {
+    if (!dev.wledTopic) { toast('No MQTT topic set for this WLED device', 'r'); return false; }
+    if (!connected) { toast('Connect to MQTT broker first', 'r'); return false; }
+    return publish(dev.wledTopic, cmd, false);
+  }
+}
+
 function wledMasterToggle(devId, on) {
   const dev = getDevice(devId); if (!dev) return;
   if (!dev.wledState) dev.wledState = {};
-  dev.wledState.on = on; wledSend(dev, { on });
+  dev.wledState.on = on;
+  wledCmd(dev, on ? 'ON' : 'OFF');  // root topic: "ON" / "OFF"
 }
 
 function wledBriCommit(devId, val) {
   const dev = getDevice(devId); if (!dev) return;
   const bri = parseInt(val);
   if (!dev.wledState) dev.wledState = {};
-  dev.wledState.bri = bri; wledSend(dev, { bri });
+  dev.wledState.bri = bri;
+  wledCmd(dev, String(bri));  // root topic: brightness as ASCII 0-255
 }
 
 function wledFxChange(devId, fx) { const dev=getDevice(devId); if(dev) wledSend(dev, { seg:[{ id:0, fx:parseInt(fx) }] }); }
@@ -846,13 +890,14 @@ function wledSegBri(devId, segId, val) { const dev=getDevice(devId); if(dev) wle
 
 /* ─── Physical relay controls ─── */
 async function wledFetchHttp(dev, path) {
+  if (IS_HTTPS || !dev.host) return null;
   try {
     const res = await fetch('http://' + dev.host + path);
     if (!res.ok) throw new Error(res.status);
-    return true;
+    return res;
   } catch(e) {
     dev.status = 'offline'; renderSidebar(); if (activeId === dev.id) renderDevice(dev.id);
-    toast('WLED unreachable', 'r'); return false;
+    toast('WLED unreachable', 'r'); return null;
   }
 }
 
@@ -933,8 +978,197 @@ function sendCmdWled(devId) {
   const dev = getDevice(devId); if (!dev) return;
   const raw = document.getElementById('cmd-'+devId).value.trim();
   if (!raw) return;
-  try { wledSend(dev, JSON.parse(raw)); toast('Sent', 'g'); }
-  catch(e) { toast('Invalid JSON: '+e.message, 'r'); }
+
+  if (raw.startsWith('{')) {
+    // JSON  →  /api  (WebSocket on HTTP, MQTT /api on HTTPS)
+    try { wledSend(dev, JSON.parse(raw)); toast('Sent → /api', 'g'); }
+    catch(e) { toast('Invalid JSON: '+e.message, 'r'); }
+
+  } else if (!IS_HTTPS && dev.host && raw.includes('=')) {
+    // HTTP API string  →  GET /win?...  (HTTP only, e.g. "FX=73&SX=128&A=200")
+    // Strip leading "win?" or "win&" if user accidentally included it
+    const params = raw.replace(/^win[?&]?/i, '');
+    wledFetchHttp(dev, '/win?' + params).then(ok => {
+      if (ok !== null) { toast('Sent → /win', 'g'); setTimeout(() => pollWledJson(dev), 300); }
+    });
+
+  } else {
+    // Plain string  →  root MQTT topic: ON / OFF / T / 0-255
+    wledCmd(dev, raw); toast('Sent → root topic', 'g');
+  }
+}
+
+/* ══════════════════════════════════════════
+   WLED RELAY PATTERN SEQUENCER
+   Client-side timed relay command sequencer.
+   Sends relay commands via HTTP or MQTT.
+══════════════════════════════════════════ */
+
+function wledPatternGetOrCreate(devId) {
+  if (!wledPatterns[devId]) wledPatterns[devId] = { steps:[], repeat:-1, cur:0, rem:0, timer:null, running:false };
+  return wledPatterns[devId];
+}
+
+function wledPatternRenderSteps(devId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const pat = wledPatternGetOrCreate(devId);
+  const relays = dev.relays || [];
+  const container = document.getElementById('psteps-' + devId);
+  if (!container) return;
+
+  if (!pat.steps.length) {
+    container.innerHTML = '<div class="pattern-empty">No steps yet — click <b>+ Step</b> to add one.</div>';
+    return;
+  }
+
+  container.innerHTML = pat.steps.map((step, i) => `
+    <div class="pstep ${pat.running && pat.cur === i ? 'active' : ''}" id="pstep-${devId}-${i}">
+      <span class="pstep-num">${String(i+1).padStart(2,'0')}</span>
+      <div class="pstep-relays">
+        ${relays.map(r => `
+          <label class="pstep-relay-lbl">
+            <input type="checkbox" ${(step.mask >> r.id) & 1 ? 'checked' : ''}
+              onchange="wledPatternSetBit('${devId}',${i},${r.id},this.checked)">
+            R${r.id+1}
+          </label>`).join('')}
+      </div>
+      <div class="pstep-dur">
+        <input type="number" class="act-input" value="${step.duration_ms}" min="50" max="60000"
+          style="width:70px" onchange="wledPatternSetDur('${devId}',${i},this.value)">
+        <span class="wg-lbl">ms</span>
+      </div>
+      <button class="pstep-del" onclick="wledPatternDelStep('${devId}',${i})">✕</button>
+    </div>`).join('');
+}
+
+function wledPatternAddStep(devId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const pat = wledPatternGetOrCreate(devId);
+  // Default: all relays ON, 500ms — or copy last step
+  const last = pat.steps[pat.steps.length - 1];
+  pat.steps.push({ mask: last ? last.mask : 0, duration_ms: last ? last.duration_ms : 500 });
+  wledPatternRenderSteps(devId);
+}
+
+function wledPatternDelStep(devId, idx) {
+  const pat = wledPatterns[devId]; if (!pat) return;
+  pat.steps.splice(idx, 1);
+  wledPatternRenderSteps(devId);
+}
+
+function wledPatternSetBit(devId, stepIdx, relayId, on) {
+  const pat = wledPatternGetOrCreate(devId);
+  if (!pat.steps[stepIdx]) return;
+  if (on) pat.steps[stepIdx].mask |=  (1 << relayId);
+  else    pat.steps[stepIdx].mask &= ~(1 << relayId);
+}
+
+function wledPatternSetDur(devId, stepIdx, val) {
+  const pat = wledPatternGetOrCreate(devId);
+  if (pat.steps[stepIdx]) pat.steps[stepIdx].duration_ms = Math.max(50, parseInt(val) || 500);
+}
+
+function wledPatternClear(devId) {
+  wledPatternStop(devId);
+  if (wledPatterns[devId]) wledPatterns[devId].steps = [];
+  wledPatternRenderSteps(devId);
+  const st = document.getElementById('pstatus-' + devId);
+  if (st) st.textContent = '';
+}
+
+function wledPatternToggle(devId) {
+  const pat = wledPatternGetOrCreate(devId);
+  if (pat.running) wledPatternStop(devId);
+  else wledPatternStart(devId);
+}
+
+function wledPatternStart(devId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const pat = wledPatternGetOrCreate(devId);
+  if (!pat.steps.length) { toast('Add at least one step first', 'r'); return; }
+  pat.running = true;
+  pat.cur = 0;
+  const repEl = document.getElementById('prep-' + devId);
+  pat.repeat = repEl ? parseInt(repEl.value) : -1;
+  pat.rem    = pat.repeat;
+  const btn = document.getElementById('pbtn-' + devId);
+  if (btn) { btn.textContent = '■ Stop'; btn.className = 'btn btn-red btn-sm'; }
+  wledPatternExecStep(devId);
+}
+
+function wledPatternStop(devId) {
+  const pat = wledPatterns[devId]; if (!pat) return;
+  if (pat.timer) { clearTimeout(pat.timer); pat.timer = null; }
+  pat.running = false;
+  const btn = document.getElementById('pbtn-' + devId);
+  if (btn) { btn.textContent = '▶ Run'; btn.className = 'btn btn-amber btn-sm'; }
+  const st = document.getElementById('pstatus-' + devId);
+  if (st) st.textContent = '';
+  // Highlight clear
+  wledPatternRenderSteps(devId);
+  // All relays off when pattern stops
+  const dev = getDevice(devId);
+  if (dev) {
+    const n = dev.relays?.length || 4;
+    if (!IS_HTTPS && dev.host) wledFetchHttp(dev, '/relays?switch=' + Array(n).fill(0).join(','));
+    else if (dev.wledTopic && connected) dev.relays?.forEach(r => publish(dev.wledTopic+'/relay/'+r.id+'/command','off',false));
+  }
+}
+
+function wledPatternExecStep(devId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const pat = wledPatterns[devId]; if (!pat || !pat.running) return;
+  const step = pat.steps[pat.cur];
+  if (!step) { wledPatternStop(devId); return; }
+
+  const relays = dev.relays || [];
+  const n = relays.length || 4;
+
+  // Build and send switch command
+  if (!IS_HTTPS && dev.host) {
+    const sw = relays.map(r => ((step.mask >> r.id) & 1) ? 1 : 0).join(',');
+    wledFetchHttp(dev, '/relays?switch=' + sw);
+  } else if (dev.wledTopic && connected) {
+    relays.forEach(r => {
+      const on = (step.mask >> r.id) & 1;
+      publish(dev.wledTopic + '/relay/' + r.id + '/command', on ? 'on' : 'off', false);
+    });
+  }
+
+  // Update relay card states optimistically
+  relays.forEach(r => {
+    const on = !!((step.mask >> r.id) & 1);
+    r.on = on; r.state = on; updateCard(dev, r);
+  });
+  updateMeta(dev);
+
+  // Highlight current step
+  wledPatternRenderSteps(devId);
+  const st = document.getElementById('pstatus-' + devId);
+  if (st) st.textContent = `step ${pat.cur+1}/${pat.steps.length}${pat.repeat>0?' · rep '+(pat.repeat-pat.rem+1)+'/'+pat.repeat:''}`;
+
+  pat.timer = setTimeout(() => {
+    if (!pat.running) return;
+    pat.cur++;
+    if (pat.cur >= pat.steps.length) {
+      // End of one cycle
+      if (pat.repeat === -1) {
+        pat.cur = 0; wledPatternExecStep(devId);       // infinite loop
+      } else {
+        pat.rem--;
+        if (pat.rem > 0) { pat.cur = 0; wledPatternExecStep(devId); }  // another rep
+        else wledPatternStop(devId);                                     // done
+      }
+    } else {
+      wledPatternExecStep(devId);
+    }
+  }, step.duration_ms);
+}
+
+// Stop pattern if device is removed
+function wledPatternCleanup(devId) {
+  wledPatternStop(devId);
+  delete wledPatterns[devId];
 }
 
 /* ── Modal type toggle ── */
@@ -1015,7 +1249,7 @@ function removeDevice(id, e) {
   if ((dev.type||'mqtt') === 'mqtt') {
     unsubscribeDevice(dev); publishPresence(dev, false);
     if (pingTimers[id]) { clearInterval(pingTimers[id]); delete pingTimers[id]; }
-  } else { wledDisconnect(dev); }
+  } else { wledDisconnect(dev); wledPatternCleanup(id); }
   devices = devices.filter(d => d.id !== id);
   if (activeId === id) activeId = devices[0]?.id || null;
   persist(); renderSidebar();
