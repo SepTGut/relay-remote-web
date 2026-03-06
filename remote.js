@@ -593,60 +593,134 @@ function wledMqttSubscribe(dev) {
   if (!connected || !dev.wledTopic) return;
   const t = dev.wledTopic;
   try {
-    client.subscribe(t + '/g');              // LED brightness
-    client.subscribe(t + '/v');              // XML LED state  
+    client.subscribe(t + '/g');             // brightness 0-255 (published on every change)
+    client.subscribe(t + '/c');             // color #RRGGBB   (published on every change)
+    client.subscribe(t + '/v');             // XML full state  (published on every change)
     client.subscribe(t + '/relay/+/state'); // MultiRelay per-relay state
-    client.subscribe(t + '/status');
+    client.subscribe(t + '/status');        // LWT
   } catch(e) { console.warn('[WLED MQTT] subscribe err', e); }
-  // Ask WLED to push its current state
-  publish(t + '/api', JSON.stringify({ v: true }), false);
+  // Trigger WLED to publish /g /c /v by requesting current brightness via root topic.
+  // Publishing the current bri (or 255 as safe default) causes WLED to re-publish state.
+  const bri = dev.wledState?.bri ?? 255;
+  publish(t, String(bri), false);
 }
 
 function wledMqttUnsubscribe(dev) {
   if (!connected || !dev.wledTopic) return;
   const t = dev.wledTopic;
-  ['g','v','status'].forEach(s => { try { client.unsubscribe(t + '/' + s); } catch {} });
+  ['g','c','v','status'].forEach(s => { try { client.unsubscribe(t + '/' + s); } catch {} });
   try { client.unsubscribe(t + '/relay/+/state'); } catch {}
 }
 
 // Called from onMessage — routes WLED MQTT messages here
 function handleWledMqtt(dev, suffix, payload) {
-  dev.lastSeen = Date.now(); dev.status = 'online';
+  if (!dev.wledState) dev.wledState = {};
 
-  // brightness → LED master state only
+  // ── /g  →  brightness (fires on every LED change) ───────────────
   if (suffix === 'g') {
-    const bri = parseInt(payload) || 0;
-    if (!dev.wledState) dev.wledState = {};
-    dev.wledState.bri = bri; dev.wledState.on = bri > 0;
+    const bri = parseInt(payload.trim()) || 0;
+    const wasOn = dev.wledState.on;
+    dev.wledState.bri = bri;
+    dev.wledState.on  = bri > 0;
+    dev.lastSeen = Date.now(); dev.status = 'online';
+    // Update LED master toggle in the WLED global bar without full redraw
+    const masterCb = document.querySelector(`#rcard-${dev.id}-master input[type=checkbox]`);
+    if (masterCb) masterCb.checked = bri > 0;
+    const briSlider = document.getElementById('bri-master-' + dev.id);
+    if (briSlider) { briSlider.value = bri; const vEl = document.getElementById('bri-val-'+dev.id); if (vEl) vEl.textContent = bri; }
     if (!dev.hasMultiRelay) {
-      if (!dev.relays?.length) dev.relays = [{ id:0, name:'Master', on:bri>0, state:bri>0, bri, col:null, timer:0 }];
-      else dev.relays.forEach(r => { r.on = bri>0; r.state = bri>0; });
+      if (!dev.relays?.length) {
+        dev.relays = [{ id:0, name:'Master', on:bri>0, state:bri>0, bri, col:null, timer:0 }];
+        if (activeId === dev.id) renderDevice(dev.id);
+      } else {
+        dev.relays.forEach(r => { r.on = bri>0; r.state = bri>0; updateCard(dev, r); });
+        updateMeta(dev);
+      }
     }
+    renderSidebar(); return;
   }
 
-  // MultiRelay per-relay retained state
+  // ── /c  →  color hex (fires on every LED change) ─────────────────
+  if (suffix === 'c') {
+    dev.wledState.color = payload.trim();
+    dev.lastSeen = Date.now(); dev.status = 'online';
+    // No relay relevance — just store it. No redraw needed.
+    return;
+  }
+
+  // ── /v  →  XML full state (fires on every change incl. relay toggles) ──
+  if (suffix === 'v') {
+    dev.lastSeen = Date.now(); dev.status = 'online';
+    const parsed = parseWledXml(payload);
+    if (parsed) {
+      dev.wledState.on  = parsed.on;
+      dev.wledState.bri = parsed.bri;
+      // Update LED UI without full redraw
+      const briSlider = document.getElementById('bri-master-' + dev.id);
+      if (briSlider) { briSlider.value = parsed.bri; const vEl = document.getElementById('bri-val-'+dev.id); if (vEl) vEl.textContent = parsed.bri; }
+      // /v doesn't carry MultiRelay relay states — those come from relay/N/state below.
+      // But if we have no MultiRelay yet, seed from LED segments.
+      if (!dev.hasMultiRelay && parsed.segs.length && !dev.relays?.length) {
+        dev.relays = parsed.segs.map(s => ({
+          id:s.id, name:s.n||('Seg '+s.id), on:s.on, state:s.on, bri:s.bri, col:null, timer:0
+        }));
+        renderSidebar(); if (activeId === dev.id) renderDevice(dev.id); return;
+      }
+    }
+    renderSidebar(); if (activeId === dev.id) renderDevice(dev.id); return;
+  }
+
+  // ── relay/N/state  →  MultiRelay per-relay state ─────────────────
+  // Published by MultiRelay usermod whenever a relay is toggled.
   const mRel = suffix.match(/^relay\/(\d+)\/state$/);
   if (mRel) {
     const id = parseInt(mRel[1]);
     const on = payload.trim().toLowerCase() === 'on';
+    dev.lastSeen = Date.now(); dev.status = 'online';
     if (!dev.relays) dev.relays = [];
     let r = dev.relays.find(r => r.id === id);
     if (!r) {
       r = { id, name:'Relay '+(id+1), on, state:on, bri:255, col:null, timer:0 };
-      dev.relays.push(r); dev.relays.sort((a,b) => a.id-b.id);
+      dev.relays.push(r); dev.relays.sort((a,b) => a.id - b.id);
       dev.hasMultiRelay = true;
       renderSidebar(); if (activeId === dev.id) renderDevice(dev.id); return;
     }
-    r.on = on; r.state = on; dev.hasMultiRelay = true;
-    if (activeId === dev.id) updateCard(dev, r);
+    r.on = on; r.state = on;
+    dev.hasMultiRelay = true;
+    if (activeId === dev.id) { updateCard(dev, r); updateMeta(dev); }
     renderSidebar(); return;
   }
 
+  // ── /status  →  LWT ──────────────────────────────────────────────
   if (suffix === 'status') {
+    const wasOnline = dev.status === 'online';
     dev.status = payload.trim().toLowerCase() === 'online' ? 'online' : 'offline';
+    dev.lastSeen = Date.now();
+    // If just came online, re-trigger state publish
+    if (dev.status === 'online' && !wasOnline) {
+      setTimeout(() => { if (dev.wledTopic && connected) publish(dev.wledTopic, String(dev.wledState?.bri ?? 255), false); }, 400);
+    }
+    renderSidebar(); if (activeId === dev.id) renderDevice(dev.id); return;
   }
+}
 
-  renderSidebar(); if (activeId === dev.id) renderDevice(dev.id);
+// Parse WLED /v XML  →  { on, bri, color, segs:[{id,on,bri,n}] }
+function parseWledXml(xml) {
+  try {
+    const doc = new DOMParser().parseFromString(xml, 'text/xml');
+    const get = tag => doc.querySelector(tag)?.textContent || null;
+    const ac  = parseInt(get('ac') || '0');
+    const cl  = get('cl') || 'FFFFFF';
+    const segs = [];
+    doc.querySelectorAll('seg').forEach(s => {
+      const id  = parseInt(s.querySelector('id')?.textContent  || '-1');
+      const on  = (s.querySelector('on')?.textContent  || '0') !== '0';
+      const bri = parseInt(s.querySelector('bri')?.textContent || '0');
+      const n   = s.querySelector('n')?.textContent || null;
+      if (id >= 0) segs.push({ id, on, bri, n });
+    });
+    return { on: ac > 0, bri: ac, color: '#' + cl, segs };
+  } catch { return null; }
 }
 
 function wledRequestState(dev) {
@@ -657,7 +731,8 @@ function wledRequestState(dev) {
     else { toast('Reconnecting…'); wledConnect(dev); }
     toast('↻ Refreshing…');
   } else if (dev.wledTopic && connected) {
-    publish(dev.wledTopic + '/api', JSON.stringify({ v: true }), false);
+    // Publishing bri to root topic causes WLED to re-publish /g /c /v
+    publish(dev.wledTopic, String(dev.wledState?.bri ?? 255), false);
     toast('↻ Pinged via MQTT');
   } else if (!connected) {
     toast('Connect to MQTT broker first', 'r');
