@@ -10,12 +10,21 @@
 </head>
 <body>
 
+<!-- Global HTTPS warning — shown only when hosted on HTTPS (e.g. GitHub Pages) -->
+<div id="https-global-warn" style="display:none;background:#1a0a00;border-bottom:2px solid #f59e0b;padding:10px 18px;font-size:11px;font-family:monospace;color:#fcd34d;line-height:1.8">
+  ⚠ <strong>HTTPS detected (GitHub Pages).</strong>
+  Relay controllers work fine via MQTT → WSS.
+  WLED devices need WebSocket (<code>ws://</code>) which is <strong>blocked by the browser on HTTPS</strong>.<br>
+  To use WLED: open this page from a local HTTP server —
+  <code>npx serve .</code> &nbsp;or&nbsp; VS Code Live Server &nbsp;or&nbsp; <code>python -m http.server</code>.
+</div>
+
 <header id="topbar">
   <div class="logo-mark">
     <div class="logo-icon">⚡</div>
     <div>
       <div class="logo-text">Relay Ctrl</div>
-      <div class="logo-sub">Remote · MQTT</div>
+      <div class="logo-sub">Remote · MQTT/WS</div>
     </div>
   </div>
   <div class="tb-div"></div>
@@ -32,8 +41,8 @@
 
   <nav id="sidebar">
     <div class="broker-panel">
-      <div class="sec-label" style="padding:0 0 10px">MQTT Broker</div>
-      <div class="field"><label>Host</label><input type="text" id="b-host" placeholder="192.168.1.x or broker.domain"></div>
+      <div class="sec-label" style="padding:0 0 10px">MQTT Broker <span style="color:var(--dim);font-size:9px">(relay controllers)</span></div>
+      <div class="field"><label>Host</label><input type="text" id="b-host" placeholder="broker.hivemq.com"></div>
       <div class="frow">
         <div class="field"><label>WS Port</label><input type="number" id="b-port" value="9001"></div>
         <div class="field" style="display:flex;align-items:flex-end;padding-bottom:2px">
@@ -41,6 +50,9 @@
             <input type="checkbox" id="b-ssl" style="width:auto">TLS/SSL
           </label>
         </div>
+      </div>
+      <div id="https-note" style="display:none;font-size:10px;color:var(--amber);margin-bottom:6px;line-height:1.5">
+        ⚠ HTTPS page — TLS forced.<br>Use port <b>8884</b> for HiveMQ WSS.
       </div>
       <div class="field"><label>Username <span style="color:var(--dim)">(optional)</span></label><input type="text" id="b-user"></div>
       <div class="field"><label>Password</label><input type="password" id="b-pass" placeholder="••••••••"></div>
@@ -73,10 +85,11 @@
         <label>Device Type</label>
         <select id="dm-type" onchange="onDevTypeChange()" style="width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--text2);font-family:var(--mono);font-size:11px;padding:6px 8px;border-radius:3px;outline:none">
           <option value="mqtt">Relay Controller (MQTT)</option>
-          <option value="wled">WLED / Relay Controller (Direct WebSocket)</option>
+          <option value="wled">WLED Device (Direct WebSocket)</option>
         </select>
       </div>
-      <!-- MQTT-only fields -->
+
+      <!-- MQTT relay controller fields -->
       <div id="dm-mqtt-fields">
         <div class="field">
           <label>Topic Prefix</label>
@@ -89,17 +102,17 @@
           <div class="hint">How often to request state from the device.</div>
         </div>
       </div>
-      <!-- WLED-only fields -->
+
+      <!-- WLED direct WebSocket fields -->
       <div id="dm-wled-fields" style="display:none">
         <div class="field">
-          <label>Device Host / IP</label>
-          <input type="text" id="dm-host" placeholder="192.168.1.x or hostname.local">
-          <div class="hint">Device must be reachable from this browser. Use ws:// for local, wss:// requires TLS on device.</div>
-        </div>
-        <div class="field">
-          <label>Poll Interval (sec, 0 = push only)</label>
-          <input type="number" id="dm-poll" value="0" min="0" max="300">
-          <div class="hint">WLED pushes state on every change. Set 0 to rely on push only.</div>
+          <label>WLED IP Address</label>
+          <input type="text" id="dm-wled-host" placeholder="192.168.1.x">
+          <div class="hint">
+            Connects via <code>ws://&lt;ip&gt;/ws</code> — direct WebSocket.<br>
+            Works on HTTP. <strong>Blocked by browser on HTTPS (GitHub Pages).</strong><br>
+            For GitHub Pages, use a relay controller instead (MQTT).
+          </div>
         </div>
       </div>
     </div>
@@ -112,9 +125,9 @@
 
 <div id="toast"></div>
 
-<!-- Paho MQTT over WebSocket -->
+<!-- Paho MQTT over WebSocket (relay controllers only — WLED uses direct WS) -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.1.0/paho-mqtt.min.js"
-  onerror="document.getElementById('conn-error').textContent='⚠ Failed to load Paho MQTT lib. Check your internet connection.';document.getElementById('conn-error').style.display='block'">
+  onerror="document.getElementById('conn-error').textContent='⚠ Failed to load Paho MQTT lib.';document.getElementById('conn-error').style.display='block'">
 </script>
 <script src="remote.js"></script>
 </body>
