@@ -14,7 +14,8 @@ let client     = null;
 let connected  = false;
 let pingTimers = {};
 let wledSockets = {};   // devId → WebSocket
-let wledPollers = {};   // devId → setInterval for reconnect
+let wledPollers    = {};   // devId → setInterval/Timeout for WS reconnect
+let wledJsonPollers = {};   // devId → setInterval for /json relay state poll
 let devices    = [];
 let activeId   = null;
 
@@ -561,11 +562,10 @@ function wledConnect(dev) {
   };
   ws.onerror = () => { dev.status = 'offline'; };
 
-  if (wledPollers[dev.id]) clearInterval(wledPollers[dev.id]);
-  wledPollers[dev.id] = setInterval(() => {
-    const s = wledSockets[dev.id];
-    if (s && s.readyState === WebSocket.OPEN) try { s.send(JSON.stringify({ v: 1 })); } catch {}
-  }, 5000);
+  // Poll /json every 3s for MultiRelay state — WebSocket doesn't reliably push it
+  if (wledJsonPollers[dev.id]) clearInterval(wledJsonPollers[dev.id]);
+  wledJsonPollers[dev.id] = setInterval(() => pollWledJson(dev), 3000);
+  pollWledJson(dev); // immediate first poll
 }
 
 function scheduleReconnect(dev) {
@@ -579,6 +579,7 @@ function wledWsClose(dev) {
   const ws = wledSockets[dev.id];
   if (ws) { ws.onclose = null; try { ws.close(); } catch {} delete wledSockets[dev.id]; }
   if (wledPollers[dev.id]) { clearInterval(wledPollers[dev.id]); clearTimeout(wledPollers[dev.id]); delete wledPollers[dev.id]; }
+  if (wledJsonPollers[dev.id]) { clearInterval(wledJsonPollers[dev.id]); delete wledJsonPollers[dev.id]; }
 }
 
 function wledDisconnect(dev) {
@@ -650,9 +651,11 @@ function handleWledMqtt(dev, suffix, payload) {
 
 function wledRequestState(dev) {
   if (!IS_HTTPS) {
+    pollWledJson(dev);  // immediate relay state refresh
     const ws = wledSockets[dev.id];
-    if (ws && ws.readyState === WebSocket.OPEN) try { ws.send(JSON.stringify({ v: 1 })); toast('↻ Requested state'); } catch {}
+    if (ws && ws.readyState === WebSocket.OPEN) try { ws.send(JSON.stringify({ v: 1 })); } catch {}
     else { toast('Reconnecting…'); wledConnect(dev); }
+    toast('↻ Refreshing…');
   } else if (dev.wledTopic && connected) {
     publish(dev.wledTopic + '/api', JSON.stringify({ v: true }), false);
     toast('↻ Pinged via MQTT');
@@ -661,33 +664,80 @@ function wledRequestState(dev) {
   }
 }
 
-/* ─── Shared state parser (WebSocket JSON) ─── */
+/* ─── /json polling — reliable MultiRelay state source ─── */
+async function pollWledJson(dev) {
+  if (!dev.host || IS_HTTPS) return;
+  try {
+    const res  = await fetch('http://' + dev.host + '/json', { signal: AbortSignal.timeout(2500) });
+    const data = await res.json();
+    dev.lastSeen = Date.now();
+
+    // Connection status
+    const wasOffline = dev.status !== 'online';
+    dev.status = 'online';
+    if (wasOffline) { renderSidebar(); }
+
+    // MultiRelay state — primary source
+    const mr = data.state?.MultiRelay;
+    if (mr && Array.isArray(mr.relays)) {
+      dev.hasMultiRelay = true;
+      const existing = dev.relays || [];
+      const newRelays = mr.relays.map(r => {
+        const old = existing.find(x => x.id === r.relay) || {};
+        return { id:r.relay, name:old.name||('Relay '+(r.relay+1)), on:!!r.state, state:!!r.state, bri:255, col:null, timer:0 };
+      });
+      // Only redraw if count changed; otherwise patch cards in-place
+      if (newRelays.length !== existing.length) {
+        dev.relays = newRelays;
+        if (activeId === dev.id) renderDevice(dev.id);
+      } else {
+        newRelays.forEach((r, i) => {
+          if (r.on !== existing[i]?.on) {
+            dev.relays[i] = r;
+            if (activeId === dev.id) updateCard(dev, r);
+          }
+        });
+        if (activeId === dev.id) updateMeta(dev);
+      }
+    }
+
+    // LED global state (bri/on) from same response
+    if (!dev.wledState) dev.wledState = {};
+    if (data.state?.bri !== undefined) dev.wledState.bri = data.state.bri;
+    if (data.state?.on  !== undefined) dev.wledState.on  = data.state.on;
+
+  } catch {
+    // Only flip offline after a few missed polls to avoid flicker
+    dev._missedPolls = (dev._missedPolls || 0) + 1;
+    if (dev._missedPolls >= 3) {
+      dev.status = 'offline';
+      dev._missedPolls = 0;
+      renderSidebar(); if (activeId === dev.id) renderDevice(dev.id);
+    }
+    return;
+  }
+  dev._missedPolls = 0;
+}
+
+/* ─── Shared state parser (WebSocket JSON — LED segments + effects list) ─── */
 function handleWledState(dev, data) {
-  dev.lastSeen = Date.now(); dev.status = 'online';
+  // WebSocket: grab effects list and LED global state only.
+  // MultiRelay relay state comes from /json polling — more reliable source.
   if (!dev.wledState) dev.wledState = {};
-  if (data.effects) dev.wledEffects = data.effects;
+  if (data.effects) { dev.wledEffects = data.effects; }
 
   const state = data.state || data;
   if (state.on  !== undefined) dev.wledState.on  = state.on;
   if (state.bri !== undefined) dev.wledState.bri = state.bri;
 
-  const mr = state.MultiRelay || data.state?.MultiRelay;
-  if (mr && Array.isArray(mr.relays)) {
-    dev.hasMultiRelay = true;
-    const existing = dev.relays || [];
-    dev.relays = mr.relays.map(r => {
-      const old = existing.find(x => x.id === r.relay) || {};
-      return { id:r.relay, name:old.name||('Relay '+(r.relay+1)), on:!!r.state, state:!!r.state, bri:255, col:null, timer:0 };
-    });
-  } else if (!dev.hasMultiRelay) {
+  // Seed relay cards from LED segments only if /json hasn't given us MultiRelay yet
+  if (!dev.hasMultiRelay) {
     const segs = state.seg || [];
-    if (segs.length) {
+    if (segs.length && !dev.relays?.length) {
       dev.relays = segs.map(s => ({ id:s.id, name:s.n||('Seg '+s.id), on:!!s.on, state:!!s.on, bri:s.bri??128, col:s.col||null, timer:0 }));
-    } else if (!dev.relays?.length) {
-      dev.relays = [{ id:0, name:'Master', on:dev.wledState.on, state:dev.wledState.on, bri:dev.wledState.bri??128, col:null, timer:0 }];
+      if (activeId === dev.id) renderDevice(dev.id);
     }
   }
-  renderSidebar(); if (activeId === dev.id) renderDevice(dev.id);
 }
 
 /* ─── LED controls (WebSocket JSON, both modes can send these) ─── */
