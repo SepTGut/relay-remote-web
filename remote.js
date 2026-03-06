@@ -1,644 +1,355 @@
 /* ═══════════════════════════════════════════════════
    RELAY CTRL — REMOTE DASHBOARD  (remote.js)
-
-   Transport matrix:
-   ┌─────────────────────┬──────────┬───────────────────────────┐
-   │ Device Type         │ Transport│ HTTPS / GitHub Pages      │
-   ├─────────────────────┼──────────┼───────────────────────────┤
-   │ Relay Controller    │ MQTT WSS │ ✅ Always works           │
-   │ WLED (MQTT)         │ MQTT WSS │ ✅ Always works           │
-   │ WLED (WebSocket)    │ ws://    │ ⚠ Unlock in Site Settings │
-   │ WLED (HTTP Poll)    │ http://  │ ⚠ Unlock in Site Settings │
-   └─────────────────────┴──────────┴───────────────────────────┘
-   Chrome 94+: no popup. Unlock: 🔒 → Site settings → Insecure content → Allow
+   MQTT over WebSocket (Paho) for relay controllers.
+   Direct WebSocket for WLED devices — HTTP only.
 ═══════════════════════════════════════════════════ */
 
 /* ── STORAGE ── */
-const SK = 'relayctrl_v3';
-function load() { try { return JSON.parse(localStorage.getItem(SK)||'{}'); } catch { return {}; } }
+const SK = 'relayctrl_v2';
+function load() { try { return JSON.parse(localStorage.getItem(SK) || '{}'); } catch { return {}; } }
 function save(d) { localStorage.setItem(SK, JSON.stringify(d)); }
 
-/* ── GLOBAL STATE ── */
-let client      = null;
-let connected   = false;
-let pingTimers  = {};
-let devices     = [];
-let activeId    = null;
-const wledSockets = {};   // devId → WebSocket
-const wledPollers = {};   // devId → setInterval
+/* ── STATE ── */
+let client     = null;
+let connected  = false;
+let pingTimers = {};
+let wledSockets = {};   // devId → WebSocket
+let wledPollers = {};   // devId → setInterval for reconnect
+let devices    = [];
+let activeId   = null;
 
-const stored = load();
-const broker = stored.broker || { host:'broker.hivemq.com', port:8884, user:'', pass:'', ssl:true };
-devices = (stored.devices||[]).map(d => ({...d, status:'offline', relays:[]}));
+const stored   = load();
+const broker   = stored.broker || { host:'', port:9001, user:'', pass:'', ssl:false };
+devices = (stored.devices || []).map(d => ({ ...d, status:'offline', relays:[] }));
+
+/* ── HTTPS DETECTION ── */
+const IS_HTTPS = location.protocol === 'https:';
 
 /* ── CLOCK ── */
 setInterval(() => { document.getElementById('clock').textContent = new Date().toTimeString().slice(0,8); }, 1000);
 
 /* ── TOAST ── */
-let _toastT;
+let toastT;
 function toast(msg, type='') {
   const el = document.getElementById('toast');
-  el.textContent = msg; el.className = 'show'+(type?' '+type:'');
-  clearTimeout(_toastT); _toastT = setTimeout(()=>el.className='', 3000);
+  el.textContent = msg;
+  el.className = 'show' + (type ? ' '+type : '');
+  clearTimeout(toastT);
+  toastT = setTimeout(() => el.className = '', 2800);
 }
 
 /* ══════════════════════════════════════════
-   TYPE HELPERS
-══════════════════════════════════════════ */
-const isWled   = d => d?.type==='wled' || d?.type==='wled-ws' || d?.type==='wled-http';
-const isWledWS = d => d?.type==='wled-ws';
-const isWledMQ = d => d?.type==='wled';
-const isWledHT = d => d?.type==='wled-http';
-const isMqttT  = d => d?.type==='mqtt' || d?.type==='wled';
-
-/* ══════════════════════════════════════════
-   MQTT
+   MQTT  (relay controllers only)
 ══════════════════════════════════════════ */
 function mqttConnect() {
-  if (typeof Paho === 'undefined') { showError('Paho not loaded — check internet.'); return; }
+  if (typeof Paho === 'undefined') {
+    showError('Paho MQTT library not loaded. Check your internet connection and reload.');
+    return;
+  }
   const host = document.getElementById('b-host').value.trim();
-  const port = parseInt(document.getElementById('b-port').value)||8884;
+  const port = parseInt(document.getElementById('b-port').value) || 9001;
   const user = document.getElementById('b-user').value.trim();
   const pass = document.getElementById('b-pass').value;
-  const ssl  = location.protocol==='https:' ? true : document.getElementById('b-ssl').checked;
-  if (!host) { toast('Enter broker host','r'); return; }
+  const ssl  = IS_HTTPS ? true : document.getElementById('b-ssl').checked;
+  if (!host) { toast('Enter broker host', 'r'); return; }
   clearError();
-  Object.assign(broker, {host, port, user, pass, ssl});
+  broker.host = host; broker.port = port; broker.user = user; broker.pass = pass; broker.ssl = ssl;
   persist();
-
-  if (client) { try{client.disconnect();}catch{} client=null; }
+  if (client) { try { client.disconnect(); } catch {} client = null; }
   connected = false;
-
-  const cid = 'relayctrl-'+Math.random().toString(36).slice(2,9);
-  const PC  = Paho.MQTT?.Client || Paho.Client;
-  client = new PC(host, port, cid);
-
-  client.onConnectionLost = r => {
-    connected = false; setConnUI(false);
-    devices.filter(isMqttT).forEach(d=>d.status='offline');
-    renderSidebar(); if(activeId) renderDevice(activeId);
-    Object.values(pingTimers).forEach(clearInterval); pingTimers={};
-    if (r.errorCode!==0) { toast('Lost: '+r.errorMessage,'r'); showError('Disconnected: '+r.errorMessage); }
+  const clientId = 'relayctrl-' + Math.random().toString(36).slice(2, 9);
+  const PahoClient = (Paho.MQTT && Paho.MQTT.Client) ? Paho.MQTT.Client : Paho.Client;
+  client = new PahoClient(host, port, clientId);
+  client.onConnectionLost = function(resp) {
+    connected = false;
+    setConnUI(false);
+    devices.filter(d => (d.type||'mqtt') === 'mqtt').forEach(d => d.status = 'offline');
+    renderSidebar();
+    if (activeId) renderDevice(activeId);
+    Object.values(pingTimers).forEach(clearInterval);
+    pingTimers = {};
+    if (resp.errorCode !== 0) {
+      toast('Disconnected: ' + resp.errorMessage, 'r');
+      showError('Lost connection: ' + resp.errorMessage);
+    }
   };
   client.onMessageArrived = onMessage;
-
-  client.connect({
-    useSSL: ssl, keepAliveInterval: 30,
-    onSuccess() {
-      connected=true; clearError(); setConnUI(true); toast('Connected → '+host,'g');
-      devices.filter(isMqttT).forEach(d=>{subscribeDevice(d);publishPresence(d,true);startPing(d);});
+  const opts = {
+    useSSL: ssl,
+    keepAliveInterval: 30,
+    onSuccess: function() {
+      connected = true;
+      clearError();
+      setConnUI(true);
+      toast('Connected to ' + host, 'g');
+      // Only subscribe relay controller (mqtt) devices — WLED uses direct WebSocket
+      devices.filter(d => (d.type||'mqtt') === 'mqtt').forEach(d => {
+        subscribeDevice(d); publishPresence(d, true); startPing(d);
+      });
     },
-    onFailure(e) {
-      connected=false; setConnUI(false);
-      const msg=e.errorMessage||('code '+e.errorCode);
-      toast('Failed: '+msg,'r');
-      showError('MQTT connect failed: '+msg+
-        '\n\nCheck:\n• Broker host & port\n• TLS checkbox matches port (8884=WSS, 9001=WS)\n• Broker has WebSocket enabled\n• No firewall blocking the port');
-    },
-    ...(user?{userName:user,password:pass}:{})
-  });
+    onFailure: function(err) {
+      connected = false;
+      setConnUI(false);
+      const msg = err.errorMessage || ('Error code ' + err.errorCode);
+      toast('Connect failed: ' + msg, 'r');
+      showError('Failed: ' + msg + '\nCheck host, port, and that broker has WebSocket enabled.');
+    }
+  };
+  if (user) { opts.userName = user; opts.password = pass; }
+  try { client.connect(opts); } catch(e) { toast('Connect error: ' + e.message, 'r'); showError(e.message); }
 }
 
 function mqttDisconnect() {
-  Object.values(pingTimers).forEach(clearInterval); pingTimers={};
-  devices.filter(isMqttT).forEach(d=>publishPresence(d,false));
-  if(client){try{client.disconnect();}catch{} client=null;}
-  connected=false; setConnUI(false);
-  devices.filter(isMqttT).forEach(d=>d.status='offline');
-  renderSidebar(); if(activeId) renderDevice(activeId);
+  Object.values(pingTimers).forEach(clearInterval);
+  pingTimers = {};
+  devices.filter(d => (d.type||'mqtt') === 'mqtt').forEach(d => publishPresence(d, false));
+  if (client) { try { client.disconnect(); } catch {} client = null; }
+  connected = false;
+  setConnUI(false);
+  devices.filter(d => (d.type||'mqtt') === 'mqtt').forEach(d => d.status = 'offline');
+  renderSidebar();
+  if (activeId) renderDevice(activeId);
 }
 
 function publish(topic, payload, retained=false) {
-  if (!connected||!client) { toast('Not connected to broker','r'); return false; }
+  if (!connected || !client) { toast('Not connected to broker', 'r'); return false; }
   try {
-    const PM = Paho.MQTT?.Message||Paho.Message;
-    const m  = new PM(String(payload));
-    m.destinationName=topic; m.retained=retained; m.qos=1;
-    client.send(m); return true;
-  } catch(e) { toast('Publish error: '+e.message,'r'); return false; }
+    const PahoMessage = (Paho.MQTT && Paho.MQTT.Message) ? Paho.MQTT.Message : Paho.Message;
+    const msg = new PahoMessage(String(payload));
+    msg.destinationName = topic;
+    msg.retained = retained;
+    msg.qos = 1;
+    client.send(msg);
+    return true;
+  } catch(e) { toast('Publish error: ' + e.message, 'r'); return false; }
 }
-const publishJSON = (t,o,r=false) => publish(t,JSON.stringify(o),r);
+
+function publishJSON(topic, obj, retained=false) { return publish(topic, JSON.stringify(obj), retained); }
 
 function subscribeDevice(dev) {
-  if (!connected||!isMqttT(dev)) return;
+  if (!connected || (dev.type||'mqtt') !== 'mqtt') return;
   try {
-    ['/v','/relay/+/v','/status','/g','/c','/sensor/+/v'].forEach(s=>client.subscribe(dev.prefix+s));
-  } catch(e){console.warn('sub err',e);}
+    client.subscribe(dev.prefix + '/v');
+    client.subscribe(dev.prefix + '/relay/+/v');
+    client.subscribe(dev.prefix + '/sensor/+/v');
+    client.subscribe(dev.prefix + '/status');
+  } catch(e) { console.warn('Subscribe error', e); }
 }
+
 function unsubscribeDevice(dev) {
-  if (!connected||!isMqttT(dev)) return;
-  ['/v','/relay/+/v','/status','/g','/c','/sensor/+/v'].forEach(s=>{try{client.unsubscribe(dev.prefix+s);}catch{}});
+  if (!connected || (dev.type||'mqtt') !== 'mqtt') return;
+  try { client.unsubscribe(dev.prefix + '/v'); } catch {}
+  try { client.unsubscribe(dev.prefix + '/relay/+/v'); } catch {}
+  try { client.unsubscribe(dev.prefix + '/sensor/+/v'); } catch {}
+  try { client.unsubscribe(dev.prefix + '/status'); } catch {}
 }
-function publishPresence(dev,on) { if(connected&&isMqttT(dev)) publish(dev.prefix+'/presence',on?'online':'offline'); }
+
+function publishPresence(dev, online) { publish(dev.prefix + '/presence', online ? 'online' : 'offline', false); }
+
 function startPing(dev) {
-  if (!isMqttT(dev)) return;
   if (pingTimers[dev.id]) clearInterval(pingTimers[dev.id]);
-  pingTimers[dev.id] = setInterval(()=>{
-    if (!connected) return;
-    isWledMQ(dev)?publishJSON(dev.prefix+'/api',{v:true}):publish(dev.prefix+'/ping','1');
-  }, (dev.pingInterval||10)*1000);
+  const iv = (dev.pingInterval || 10) * 1000;
+  pingTimers[dev.id] = setInterval(() => { if (connected) publish(dev.prefix + '/ping', '1', false); }, iv);
 }
 
-/* ── MQTT INCOMING ── */
+/* ── INCOMING MQTT MESSAGES (relay controllers only) ── */
 function onMessage(msg) {
-  const topic=msg.destinationName, payload=msg.payloadString;
-  const dev=devices.find(d=>isMqttT(d)&&(topic.startsWith(d.prefix+'/')||topic===d.prefix));
+  const topic   = msg.destinationName;
+  const payload = msg.payloadString;
+  // Match only mqtt-type devices
+  const dev = devices.find(d => (d.type||'mqtt') === 'mqtt' && d.prefix && (topic === d.prefix || topic.startsWith(d.prefix + '/')));
   if (!dev) return;
-  const sfx=topic.slice(dev.prefix.length+1);
+  const suffix = topic.slice(dev.prefix.length + 1);
 
-  if (sfx==='v') {
+  if (suffix === 'v') {
     try {
-      const data=JSON.parse(payload);
+      const data = JSON.parse(payload);
+      let changed = false;
       if (Array.isArray(data.relays)) {
-        dev.relays=data.relays.map(r=>({...r,state:r.on}));
-        dev.status='online'; dev.lastSeen=Date.now();
-        renderSidebar(); if(activeId===dev.id) renderDevice(dev.id);
-      } else if (data.state||data.seg) {
-        wledHandleState(dev,data);
+        dev.relays = data.relays.map(r => ({ ...r, state: r.on }));
+        dev.status = 'online'; dev.lastSeen = Date.now(); changed = true;
       }
-    } catch(e){console.warn('/v err',e);}
+      if (Array.isArray(data.sensors)) {
+        const prev = dev.sensors || [];
+        dev.sensors = data.sensors;
+        if (prev.length !== data.sensors.length) { changed = true; }
+        else { data.sensors.forEach(s => updateSensorCard(dev, s)); }
+      }
+      if (changed) { renderSidebar(); if (activeId === dev.id) renderDevice(dev.id); }
+    } catch(e) { console.warn('/v parse err', e); }
     return;
   }
-  if (sfx==='g') {
-    const bri=parseInt(payload)||0;
-    if(!dev.wledState)dev.wledState={on:false,bri:0};
-    dev.wledState.bri=bri; dev.wledState.on=bri>0;
-    dev.status='online'; dev.lastSeen=Date.now(); renderSidebar();
-    if(activeId===dev.id){const s=document.getElementById('bri-master-'+dev.id);if(s)s.value=bri;const v=document.getElementById('bri-val-'+dev.id);if(v)v.textContent=bri;}
-    return;
-  }
-  if (sfx==='c') {
-    if(!dev.wledState)dev.wledState={on:false,bri:0};
-    dev.wledState.color=payload.trim();
-    if(activeId===dev.id){const s=document.getElementById('master-color-'+dev.id);if(s)s.style.background=dev.wledState.color;}
-    return;
-  }
-  if (sfx==='status') {
-    const was=dev.status==='online';
-    dev.status=payload.trim().toLowerCase()==='online'?'online':'offline'; dev.lastSeen=Date.now();
-    if(dev.status==='online'&&!was) setTimeout(()=>publish(dev.prefix+'/ping','1'),400);
-    renderSidebar(); if(activeId===dev.id) renderDevice(dev.id);
-    return;
-  }
-  const rm=sfx.match(/^relay\/(\d+)\/v$/);
-  if (rm) {
-    const id=parseInt(rm[1]);
-    if(!dev.relays)dev.relays=[];
-    let r=dev.relays.find(r=>r.id===id);
-    if(!r){r={id,name:'Relay '+(id+1),on:false,state:false};dev.relays.push(r);dev.relays.sort((a,b)=>a.id-b.id);}
-    r.on=payload.trim().toLowerCase()==='on'; r.state=r.on;
-    dev.status='online'; dev.lastSeen=Date.now();
-    if(activeId===dev.id)updateCard(dev,r); renderSidebar();
-    return;
-  }
-  const sm=sfx.match(/^sensor\/(\d+)\/v$/);
-  if (sm) {
-    const id=parseInt(sm[1]);
-    if(!dev.sensors)dev.sensors=[];
-    let s=dev.sensors.find(s=>s.id===id);
-    if(!s){s={id,name:'Sensor '+(id+1),state:false};dev.sensors.push(s);}
-    s.state=['on','active'].includes(payload.trim().toLowerCase());
-    dev.lastSeen=Date.now();
-    if(activeId===dev.id){const d=document.getElementById('sensor-dot-'+dev.id+'-'+id);if(d)d.className='sensor-dot '+(s.state?'active':'');}
-  }
-}
 
-/* ══════════════════════════════════════════
-   WLED — WEBSOCKET  (wled-ws)
-   On HTTPS: Chrome 94+ has NO popup. User must
-   manually allow in: 🔒 → Site settings → Insecure content → Allow
-══════════════════════════════════════════ */
-function wledConnect(dev) {
-  if (!isWledWS(dev)) return;
-  if (wledSockets[dev.id]) { try{wledSockets[dev.id].onclose=null;wledSockets[dev.id].close();}catch{} }
-  const proto = location.protocol==='https:' ? 'wss' : 'ws';
-  const url   = `${proto}://${dev.host}/ws`;
-  let ws;
-  try { ws = new WebSocket(url); }
-  catch(e) { dev.status='offline'; dev.wsError='WS init failed: '+e.message; renderSidebar(); return; }
-  wledSockets[dev.id] = ws;
-
-  ws.onopen = () => {
-    dev.status='online'; dev.wsError=null; dev.lastSeen=Date.now();
-    renderSidebar(); if(activeId===dev.id) renderDevice(dev.id);
-    ws.send(JSON.stringify({v:true}));
-    toast('WS → '+dev.name,'g');
-    if (!dev.wledEffects) {
-      fetch(`${location.protocol==='https:'?'https':'http'}://${dev.host}/json/eff`)
-        .then(r=>r.json()).then(a=>{if(Array.isArray(a)){dev.wledEffects=a;if(activeId===dev.id)renderDevice(dev.id);}}).catch(()=>{});
-    }
-    if ((dev.pollInterval||0)>0) {
-      wledPollers[dev.id]=setInterval(()=>{if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({v:true}));},dev.pollInterval*1000);
-    }
-  };
-  ws.onmessage = e => { try{wledHandleState(dev,JSON.parse(e.data));}catch{} };
-  ws.onerror   = () => {
-    dev.status='offline'; dev.wsError='Connection refused or blocked by browser';
-    renderSidebar(); if(activeId===dev.id) renderDevice(dev.id);
-  };
-  ws.onclose   = () => {
-    dev.status='offline'; renderSidebar(); if(activeId===dev.id) renderDevice(dev.id);
-    setTimeout(()=>{ if(devices.find(d=>d.id===dev.id)) wledConnect(dev); },5000);
-  };
-}
-
-function wledDisconnect(dev) {
-  if (wledPollers[dev.id]) { clearInterval(wledPollers[dev.id]); delete wledPollers[dev.id]; }
-  if (wledSockets[dev.id]) {
-    const ws=wledSockets[dev.id]; ws.onclose=null;
-    try{ws.close();}catch{} delete wledSockets[dev.id];
+  if (suffix === 'status') {
+    const wasOnline = dev.status === 'online';
+    dev.status = payload.trim().toLowerCase() === 'online' ? 'online' : 'offline';
+    dev.lastSeen = Date.now();
+    if (dev.status === 'online' && !wasOnline) setTimeout(() => publish(dev.prefix + '/ping', '1', false), 400);
+    renderSidebar(); if (activeId === dev.id) renderDevice(dev.id); return;
   }
-  dev.status='offline';
-}
 
-/* ══════════════════════════════════════════
-   WLED — HTTP POLLING  (wled-http)
-   Same as your working standalone page.
-   On HTTPS: same "unlock" needed as WebSocket.
-   On HTTP (local): just works.
-══════════════════════════════════════════ */
-function wledHttpStart(dev) {
-  if (!isWledHT(dev)) return;
-  if (wledPollers[dev.id]) clearInterval(wledPollers[dev.id]);
-  dev.status='connecting';
-  wledHttpFetch(dev);
-  wledPollers[dev.id] = setInterval(()=>wledHttpFetch(dev), (dev.pollInterval||3)*1000);
-}
+  const mRel = suffix.match(/^relay\/(\d+)\/v$/);
+  if (mRel) {
+    const id = parseInt(mRel[1]);
+    if (!dev.relays) dev.relays = [];
+    let r = dev.relays.find(r => r.id === id);
+    if (!r) { r = { id, name:'Relay '+(id+1), on:false, state:false }; dev.relays.push(r); dev.relays.sort((a,b)=>a.id-b.id); }
+    r.on = payload.trim().toLowerCase() === 'on'; r.state = r.on;
+    dev.status = 'online'; dev.lastSeen = Date.now();
+    if (activeId === dev.id) updateCard(dev, r); renderSidebar(); return;
+  }
 
-function wledHttpStop(dev) {
-  if (wledPollers[dev.id]) { clearInterval(wledPollers[dev.id]); delete wledPollers[dev.id]; }
-  dev.status='offline';
-}
-
-async function wledHttpFetch(dev) {
-  const proto = location.protocol==='https:' ? 'https' : 'http';
-  try {
-    const r = await fetch(`${proto}://${dev.host}/json`, {cache:'no-store'});
-    if (!r.ok) throw new Error('HTTP '+r.status);
-    const data = await r.json();
-    dev.status='online'; dev.lastSeen=Date.now(); dev.wsError=null;
-    // Parse MultiRelay format (your working page's format)
-    const mr = data.state?.MultiRelay?.relays;
-    if (Array.isArray(mr)) {
-      if (!dev.relays) dev.relays=[];
-      mr.forEach(item=>{
-        let r=dev.relays.find(r=>r.id===item.relay);
-        if (!r){r={id:item.relay,name:'Relay '+item.relay,on:false,state:false};dev.relays.push(r);dev.relays.sort((a,b)=>a.id-b.id);}
-        r.on=!!item.state; r.state=r.on;
-      });
-    }
-    // Also parse WLED full state (segments etc.)
-    if (data.state||data.seg) {
-      wledHandleState(dev, data);
+  const mSen = suffix.match(/^sensor\/(\d+)\/v$/);
+  if (mSen) {
+    const id = parseInt(mSen[1]);
+    if (!dev.sensors) dev.sensors = [];
+    let s = dev.sensors.find(s => s.id === id);
+    const active = payload.trim().toLowerCase() === 'active';
+    if (!s) {
+      s = { id, name:'Sensor '+(id+1), active };
+      dev.sensors.push(s); dev.sensors.sort((a,b) => a.id - b.id);
+      dev.status = 'online'; dev.lastSeen = Date.now();
+      if (activeId === dev.id) renderDevice(dev.id);
     } else {
-      renderSidebar(); if(activeId===dev.id) renderDevice(dev.id);
+      s.active = active; dev.status = 'online'; dev.lastSeen = Date.now();
+      updateSensorCard(dev, s);
     }
-  } catch(e) {
-    dev.status='offline'; dev.wsError=String(e);
-    renderSidebar(); if(activeId===dev.id) renderDevice(dev.id);
+    return;
   }
 }
 
-async function wledHttpToggle(dev, relayIndex, newState) {
-  // WLED MultiRelay HTTP API: /relays?switch=0,1,0,1
-  const states = (dev.relays||[]).map(r=>r.id===relayIndex?(newState?1:0):(r.on?1:0));
-  // Pad to 4
-  while(states.length<4) states.push(0);
-  const sw = states.slice(0,4).join(',');
-  const proto = location.protocol==='https:'?'https':'http';
-  try {
-    await fetch(`${proto}://${dev.host}/relays?switch=${sw}`, {cache:'no-store'});
-    setTimeout(()=>wledHttpFetch(dev), 200);
-  } catch(e) { dev.status='offline'; dev.wsError=String(e); renderSidebar(); }
+/* ── RELAY CONTROL (mqtt type) ── */
+function toggleRelay(devId, relayId, on) {
+  const dev = getDevice(devId); if (!dev) return;
+  if (isWled(dev)) { toggleRelayWled(devId, relayId, on); return; }
+  publishJSON(dev.prefix + '/relay/' + relayId + '/api', { on });
+  const r = dev.relays?.find(r => r.id === relayId);
+  if (r) { r.on = on; r.state = on; updateCard(dev, r); updateMeta(dev); }
 }
 
-async function wledHttpSendJson(dev, payload) {
-  const proto = location.protocol==='https:'?'https':'http';
-  try {
-    await fetch(`${proto}://${dev.host}/json/state`, {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload), cache:'no-store'
-    });
-    setTimeout(()=>wledHttpFetch(dev),200);
-  } catch(e) { dev.status='offline'; renderSidebar(); }
+function pulseRelay(devId, relayId) {
+  const dev = getDevice(devId); if (!dev) return;
+  if (isWled(dev)) { pulseRelayWled(devId, relayId); return; }
+  const ms = parseInt(document.getElementById('pm-'+devId+'-'+relayId).value) || 500;
+  publishJSON(dev.prefix + '/relay/' + relayId + '/api', { pulse: ms });
+  toast('Pulse '+ms+'ms → '+dev.name);
 }
 
-/* ══════════════════════════════════════════
-   WLED UNIFIED SEND
-══════════════════════════════════════════ */
-function wledSend(dev, payload) {
-  if (isWledWS(dev)) {
-    const ws=wledSockets[dev.id];
-    if (!ws||ws.readyState!==WebSocket.OPEN) { toast('WS not open','r'); return false; }
-    ws.send(JSON.stringify(payload)); return true;
-  }
-  if (isWledHT(dev)) { wledHttpSendJson(dev,payload); return true; }
-  return publishJSON(dev.prefix+'/api', payload);
+function timerRelay(devId, relayId) {
+  const dev = getDevice(devId); if (!dev) return;
+  if (isWled(dev)) { timerRelayWled(devId, relayId); return; }
+  const s = parseInt(document.getElementById('ts-'+devId+'-'+relayId).value) || 30;
+  publishJSON(dev.prefix + '/relay/' + relayId + '/api', { timer: s });
+  toast('Timer '+s+'s → '+dev.name);
 }
 
-/* ── WLED STATE HANDLER (all transports share this) ── */
-function wledHandleState(dev, data) {
-  const state=data.state||data; if(!state) return;
-  dev.lastSeen=Date.now(); dev.status='online';
-  if (!dev.wledState) dev.wledState={};
-  Object.assign(dev.wledState, {on:state.on, bri:state.bri??128, transition:state.transition??7});
-  if (Array.isArray(state.seg)) {
-    dev.relays = state.seg.filter(s=>s&&typeof s.id==='number').map(s=>({
-      id:s.id, name:s.n||('Seg '+s.id), on:!!s.on, state:!!s.on,
-      bri:s.bri??(s.on?255:0), timer:s.timer||0, fx:s.fx??0, sx:s.sx??128, col:s.col
-    }));
-  }
-  if (data.info) {
-    dev.wledInfo={ver:data.info.ver,name:data.info.name,brand:data.info.brand,leds:data.info.leds};
-    dev.isRelayCtrl=(data.info.brand==='WLED-Relay');
-  }
-  if (Array.isArray(data.effects)) dev.wledEffects=data.effects;
-  renderSidebar(); if(activeId===dev.id) renderDevice(dev.id);
-}
-
-/* ── WLED CONTROLS ── */
-function wledMasterToggle(devId,on) {
-  const dev=getDevice(devId);if(!dev)return;
-  if(!dev.wledState)dev.wledState={};  dev.wledState.on=on;
-  if(isWledWS(dev)||isWledHT(dev)) wledSend(dev,{on});
-  else publish(dev.prefix, on?'ON':'OFF');
-  if(activeId===dev.id) renderDevice(dev.id);
-}
-function wledBriCommit(devId,val) {
-  const dev=getDevice(devId);if(!dev)return;
-  const bri=parseInt(val); if(!dev.wledState)dev.wledState={}; dev.wledState.bri=bri;
-  wledSend(dev,{bri});
-}
-function wledFxChange(devId,fx)   {const dev=getDevice(devId);if(!dev)return;wledSend(dev,{seg:[{id:0,fx:parseInt(fx)}]});}
-function wledSpeedChange(devId,sx){const dev=getDevice(devId);if(!dev)return;wledSend(dev,{seg:[{id:0,sx:parseInt(sx)}]});}
-function wledSegBri(devId,sid,v)  {
-  const dev=getDevice(devId);if(!dev)return;
-  const bri=parseInt(v),r=dev.relays?.find(r=>r.id===sid);if(r)r.bri=bri;
-  wledSend(dev,{seg:[{id:sid,bri}]});
-}
-function toggleRelayWled(devId,rid,on) {
-  const dev=getDevice(devId);if(!dev)return;
-  if (isWledHT(dev)) { wledHttpToggle(dev,rid,on); }
-  else wledSend(dev,{seg:[{id:rid,on}]});
-  const r=dev.relays?.find(r=>r.id===rid);
-  if(r){r.on=on;r.state=on;updateCard(dev,r);updateMeta(dev);}
-}
-function pulseRelayWled(devId,rid) {
-  const dev=getDevice(devId);if(!dev)return;
-  const ms=parseInt(document.getElementById('pm-'+devId+'-'+rid).value)||500;
-  if(isWledHT(dev)){wledHttpToggle(dev,rid,true);setTimeout(()=>wledHttpToggle(dev,rid,false),ms);}
-  else{wledSend(dev,{seg:[{id:rid,on:true}]});setTimeout(()=>wledSend(dev,{seg:[{id:rid,on:false}]}),ms);}
-  toast('Pulse '+ms+'ms → S'+rid);
-}
-function timerRelayWled(devId,rid) {
-  const dev=getDevice(devId);if(!dev)return;
-  const s=parseInt(document.getElementById('ts-'+devId+'-'+rid).value)||30;
-  if(isWledHT(dev)){wledHttpToggle(dev,rid,true);setTimeout(()=>wledHttpToggle(dev,rid,false),s*1000);}
-  else{wledSend(dev,{seg:[{id:rid,on:true}]});setTimeout(()=>wledSend(dev,{seg:[{id:rid,on:false}]}),s*1000);}
-  toast('Timer '+s+'s → S'+rid);
-}
-function allOffWled(devId) {
-  const dev=getDevice(devId);if(!dev)return;
-  if(isWledHT(dev))wledHttpSendJson(dev,{on:false});else wledSend(dev,{on:false});
-  if(dev.wledState)dev.wledState.on=false;
-  dev.relays?.forEach(r=>{r.on=false;r.state=false;updateCard(dev,r);}); updateMeta(dev);
-  toast('All OFF — '+dev.name,'r');
-}
-function allOnWled(devId) {
-  const dev=getDevice(devId);if(!dev)return;
-  if(isWledHT(dev))wledHttpSendJson(dev,{on:true});else wledSend(dev,{on:true});
-  if(dev.wledState)dev.wledState.on=true;
-  dev.relays?.forEach(r=>{r.on=true;r.state=true;updateCard(dev,r);}); updateMeta(dev);
-  toast('All ON — '+dev.name);
-}
-function sendCmdWled(devId) {
-  const dev=getDevice(devId);if(!dev)return;
-  const raw=document.getElementById('cmd-'+devId).value.trim();if(!raw)return;
-  try{const o=JSON.parse(raw);wledSend(dev,o);toast('Sent','g');}
-  catch(e){toast('Bad JSON','r');}
-}
-
-/* ══════════════════════════════════════════
-   RELAY CTRL ROUTING
-══════════════════════════════════════════ */
-function toggleRelay(devId,rid,on) {
-  const dev=getDevice(devId);if(!dev)return;
-  if(isWled(dev)){toggleRelayWled(devId,rid,on);return;}
-  publishJSON(dev.prefix+'/relay/'+rid+'/api',{on});
-  const r=dev.relays?.find(r=>r.id===rid);
-  if(r){r.on=on;r.state=on;updateCard(dev,r);updateMeta(dev);}
-}
-function pulseRelay(devId,rid) {
-  const dev=getDevice(devId);if(!dev)return;
-  if(isWled(dev)){pulseRelayWled(devId,rid);return;}
-  const ms=parseInt(document.getElementById('pm-'+devId+'-'+rid).value)||500;
-  publishJSON(dev.prefix+'/relay/'+rid+'/api',{pulse:ms}); toast('Pulse '+ms+'ms');
-}
-function timerRelay(devId,rid) {
-  const dev=getDevice(devId);if(!dev)return;
-  if(isWled(dev)){timerRelayWled(devId,rid);return;}
-  const s=parseInt(document.getElementById('ts-'+devId+'-'+rid).value)||30;
-  publishJSON(dev.prefix+'/relay/'+rid+'/api',{timer:s}); toast('Timer '+s+'s');
-}
 function allOff(devId) {
-  const dev=getDevice(devId);if(!dev)return;
-  if(isWled(dev)){allOffWled(devId);return;}
-  publishJSON(dev.prefix+'/api',{on:false});
-  dev.relays?.forEach(r=>{r.on=false;r.state=false;updateCard(dev,r);}); updateMeta(dev);
-  toast('All OFF','r');
+  const dev = getDevice(devId); if (!dev) return;
+  if (isWled(dev)) { allOffWled(devId); return; }
+  publishJSON(dev.prefix + '/api', { on: false });
+  dev.relays?.forEach(r => { r.on = false; r.state = false; updateCard(dev, r); });
+  updateMeta(dev); toast('All OFF — '+dev.name, 'r');
 }
+
 function allOn(devId) {
-  const dev=getDevice(devId);if(!dev)return;
-  if(isWled(dev)){allOnWled(devId);return;}
-  publishJSON(dev.prefix+'/api',{on:true});
-  dev.relays?.forEach(r=>{r.on=true;r.state=true;updateCard(dev,r);}); updateMeta(dev);
-  toast('All ON');
+  const dev = getDevice(devId); if (!dev) return;
+  if (isWled(dev)) { allOnWled(devId); return; }
+  publishJSON(dev.prefix + '/api', { on: true });
+  dev.relays?.forEach(r => { r.on = true; r.state = true; updateCard(dev, r); });
+  updateMeta(dev); toast('All ON — '+dev.name);
 }
+
 function sendCmd(devId) {
-  const dev=getDevice(devId);if(!dev)return;
-  if(isWled(dev)){sendCmdWled(devId);return;}
-  const raw=document.getElementById('cmd-'+devId).value.trim();if(!raw)return;
-  try{JSON.parse(raw);}catch(e){toast('Bad JSON','r');return;}
-  publish(dev.prefix+'/api',raw); toast('Sent','g');
+  const dev = getDevice(devId); if (!dev) return;
+  if (isWled(dev)) { sendCmdWled(devId); return; }
+  const raw = document.getElementById('cmd-'+devId).value.trim();
+  if (!raw) return;
+  try { JSON.parse(raw); } catch(e) { toast('Invalid JSON: '+e.message, 'r'); return; }
+  publish(dev.prefix + '/api', raw); toast('Sent', 'g');
 }
+
 function pingDevice(id) {
-  const dev=getDevice(id);if(!dev)return;
-  if(isWledWS(dev)){const ws=wledSockets[dev.id];if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({v:true}));return;}
-  if(isWledHT(dev)){wledHttpFetch(dev);return;}
-  if(isWledMQ(dev)){publishJSON(dev.prefix+'/api',{v:true});return;}
-  publish(dev.prefix+'/ping','1');
+  const dev = getDevice(id); if (!dev) return;
+  if (isWled(dev)) { wledRequestState(dev); return; }
+  publish(dev.prefix + '/ping', '1', false);
 }
 
 /* ══════════════════════════════════════════
-   MODAL
+   UI
 ══════════════════════════════════════════ */
-function onDevTypeChange() {
-  const t = document.getElementById('dm-type').value;
-  document.getElementById('dm-mqtt-fields').style.display = (t==='mqtt'||t==='wled')?'':'none';
-  document.getElementById('dm-ws-fields').style.display   = (t==='wled-ws'||t==='wled-http')?'':'none';
-  const note = document.getElementById('dm-wled-note');
-  note.style.display = isWled({type:t})?'':'none';
-  if (note.style.display!=='none') {
-    note.querySelector('.note-mqtt').style.display  = t==='wled'?'':'none';
-    note.querySelector('.note-ws').style.display    = t==='wled-ws'?'':'none';
-    note.querySelector('.note-http').style.display  = t==='wled-http'?'':'none';
+function setConnUI(on) {
+  document.getElementById('conn-dot').className    = 'cdot'+(on?' on':'');
+  document.getElementById('conn-label').textContent = on ? 'online' : 'offline';
+  const ts = document.getElementById('tb-status');
+  ts.textContent = on ? 'CONNECTED' : 'DISCONNECTED'; ts.className = 'tb-val '+(on?'g':'r');
+  document.getElementById('btn-connect').style.display    = on ? 'none' : '';
+  document.getElementById('btn-disconnect').style.display = on ? '' : 'none';
+}
+
+function showError(msg) { const el=document.getElementById('conn-error'); el.textContent=msg; el.style.display='block'; }
+function clearError()   { const el=document.getElementById('conn-error'); el.textContent='';  el.style.display='none';  }
+
+function renderSidebar() {
+  const list = document.getElementById('device-list');
+  list.innerHTML = '';
+  if (!devices.length) {
+    list.innerHTML = '<div style="padding:12px 14px;font-size:10px;color:var(--dim)">No devices yet.</div>';
   }
-  const ph=document.getElementById('dm-prefix'), hint=document.getElementById('dm-prefix-hint');
-  if(t==='wled'){if(ph&&!ph.value)ph.placeholder='wled/strip1';if(hint)hint.textContent='Match MQTT Topic in WLED → Settings → Sync Interfaces → MQTT.';}
-  else{if(ph&&!ph.value)ph.placeholder='home/relay';if(hint)hint.textContent='Match prefix in ESP32 firmware config.';}
-}
-
-/* ── DEVICE CRUD ── */
-function getDevice(id){return devices.find(d=>d.id===id);}
-
-function openAddDevice() {
-  document.getElementById('modal-title').textContent='Add Device';
-  ['dm-id','dm-name','dm-prefix','dm-host'].forEach(i=>document.getElementById(i).value='');
-  document.getElementById('dm-type').value='mqtt';
-  document.getElementById('dm-ping').value='10';
-  document.getElementById('dm-poll').value='3';
-  onDevTypeChange();
-  document.getElementById('add-modal').classList.add('open');
-  setTimeout(()=>document.getElementById('dm-name').focus(),100);
-}
-function openEditDevice(id) {
-  const d=getDevice(id);if(!d)return;
-  document.getElementById('modal-title').textContent='Edit Device';
-  document.getElementById('dm-id').value=d.id;
-  document.getElementById('dm-name').value=d.name;
-  document.getElementById('dm-type').value=d.type||'mqtt';
-  document.getElementById('dm-prefix').value=d.prefix||'';
-  document.getElementById('dm-ping').value=d.pingInterval||10;
-  document.getElementById('dm-host').value=d.host||'';
-  document.getElementById('dm-poll').value=d.pollInterval||3;
-  onDevTypeChange();
-  document.getElementById('add-modal').classList.add('open');
-}
-function closeModal(){document.getElementById('add-modal').classList.remove('open');}
-
-function saveDevice() {
-  const eid=document.getElementById('dm-id').value;
-  const name  =document.getElementById('dm-name').value.trim()||'Device';
-  const type  =document.getElementById('dm-type').value||'mqtt';
-  const prefix=document.getElementById('dm-prefix').value.trim().replace(/\/+$/,'')||'home/relay';
-  const ping  =parseInt(document.getElementById('dm-ping').value)||10;
-  const host  =document.getElementById('dm-host').value.trim();
-  const poll  =parseInt(document.getElementById('dm-poll').value)||3;
-  if ((type==='wled-ws'||type==='wled-http')&&!host){toast('Enter WLED IP/host','r');return;}
-
-  if (eid) {
-    const dev=getDevice(eid);if(!dev)return;
-    // teardown
-    if(isWledWS(dev))wledDisconnect(dev);
-    else if(isWledHT(dev))wledHttpStop(dev);
-    else{unsubscribeDevice(dev);if(pingTimers[dev.id]){clearInterval(pingTimers[dev.id]);delete pingTimers[dev.id];}}
-    Object.assign(dev,{name,type,prefix,pingInterval:ping,host,pollInterval:poll});
-    // setup
-    if(isWledWS(dev))wledConnect(dev);
-    else if(isWledHT(dev))wledHttpStart(dev);
-    else if(connected){subscribeDevice(dev);publishPresence(dev,true);startPing(dev);}
-  } else {
-    const dev={id:'dev-'+Date.now(),name,type,prefix,pingInterval:ping,host,pollInterval:poll,status:'offline',lastSeen:null,relays:[]};
-    devices.push(dev);
-    if(isWledWS(dev))wledConnect(dev);
-    else if(isWledHT(dev))wledHttpStart(dev);
-    else if(connected){subscribeDevice(dev);publishPresence(dev,true);startPing(dev);}
-    selectDevice(dev.id);
-  }
-  persist();renderSidebar();closeModal();toast('Saved','g');
-}
-
-function removeDevice(id,e) {
-  if(e)e.stopPropagation();
-  const dev=getDevice(id);if(!dev)return;
-  if(!confirm('Remove "'+dev.name+'"?'))return;
-  if(isWledWS(dev))wledDisconnect(dev);
-  else if(isWledHT(dev))wledHttpStop(dev);
-  else{unsubscribeDevice(dev);publishPresence(dev,false);if(pingTimers[id]){clearInterval(pingTimers[id]);delete pingTimers[id];}}
-  devices=devices.filter(d=>d.id!==id);
-  if(activeId===id)activeId=devices[0]?.id||null;
-  persist();renderSidebar();
-  if(activeId)renderDevice(activeId);
-  else document.getElementById('main').innerHTML=emptyHTML('📡','No Device Selected','Add a device.');
-}
-
-function persist() {
-  save({broker, devices:devices.map(({id,name,type,prefix,pingInterval,host,pollInterval})=>
-    ({id,name,type:type||'mqtt',prefix,pingInterval:pingInterval||10,host:host||'',pollInterval:pollInterval||3}))});
-}
-
-/* ══════════════════════════════════════════
-   UI RENDER
-══════════════════════════════════════════ */
-function setConnUI(on){
-  document.getElementById('conn-dot').className='cdot'+(on?' on':'');
-  document.getElementById('conn-label').textContent=on?'online':'offline';
-  const ts=document.getElementById('tb-status');ts.textContent=on?'CONNECTED':'DISCONNECTED';ts.className='tb-val '+(on?'g':'r');
-  document.getElementById('btn-connect').style.display=on?'none':'';
-  document.getElementById('btn-disconnect').style.display=on?'':'none';
-}
-function showError(msg){const e=document.getElementById('conn-error');e.textContent=msg;e.style.display='block';}
-function clearError(){const e=document.getElementById('conn-error');e.textContent='';e.style.display='none';}
-
-function renderSidebar(){
-  const list=document.getElementById('device-list');list.innerHTML='';
-  if(!devices.length){list.innerHTML='<div style="padding:12px 14px;font-size:10px;color:var(--dim)">No devices yet.</div>';}
-  devices.forEach(dev=>{
-    const el=document.createElement('div');
-    el.className='device-item'+(dev.id===activeId?' active':'');
-    const badges={'wled':'WLED·MQ','wled-ws':'WLED·WS','wled-http':'WLED·HTTP'};
-    const btype={'wled':'wled','wled-ws':'wled-ws','wled-http':'wled-http'};
-    const badge=badges[dev.type]?`<span class="dev-badge ${btype[dev.type]}">${badges[dev.type]}</span>`:'';
-    el.innerHTML=`<div class="dev-left"><span class="dev-dot ${dev.status||'offline'}"></span><span class="dev-name">${esc(dev.name)}</span>${badge}</div><button class="dev-remove" onclick="removeDevice('${dev.id}',event)">✕</button>`;
-    el.onclick=e=>{if(e.target.closest('.dev-remove'))return;selectDevice(dev.id);};
+  devices.forEach(dev => {
+    const el = document.createElement('div');
+    el.className = 'device-item' + (dev.id === activeId ? ' active' : '');
+    const wledOk = isWled(dev) && !IS_HTTPS;
+    const wledBadge = isWled(dev)
+      ? `<span class="dev-badge wled">${wledOk ? (dev.hasMultiRelay ? 'WLED+R' : 'WLED') : 'WLED⚠'}</span>`
+      : '';
+    el.innerHTML = `
+      <div class="dev-left">
+        <span class="dev-dot ${dev.status||'offline'}"></span>
+        <span class="dev-name">${esc(dev.name)}</span>
+        ${wledBadge}
+      </div>
+      <button class="dev-remove" onclick="removeDevice('${dev.id}',event)">✕</button>`;
+    el.onclick = e => { if (e.target.closest('.dev-remove')) return; selectDevice(dev.id); };
     list.appendChild(el);
   });
-  const tbd=document.getElementById('tb-devices');if(tbd)tbd.textContent=devices.length;
+  const el = document.getElementById('tb-devices');
+  if (el) el.textContent = devices.length;
 }
 
-function selectDevice(id){activeId=id;renderSidebar();renderDevice(id);}
+function selectDevice(id) { activeId = id; renderSidebar(); renderDevice(id); }
 
-function protoBadgeHTML(dev) {
-  if(dev.type==='wled')     return '<span class="pill" style="background:rgba(56,184,200,.15);border:1px solid var(--teal);color:var(--teal)">WLED · MQTT</span>';
-  if(dev.type==='wled-ws')  return '<span class="pill" style="background:rgba(147,120,232,.15);border:1px solid var(--purple);color:var(--purple)">WLED · WebSocket</span>';
-  if(dev.type==='wled-http')return '<span class="pill" style="background:rgba(245,158,11,.15);border:1px solid var(--amber);color:var(--amber)">WLED · HTTP Poll</span>';
-  return '<span class="pill pill-d">MQTT</span>';
-}
+function renderDevice(id) {
+  const main = document.getElementById('main');
+  const dev  = getDevice(id);
+  if (!dev) { main.innerHTML = emptyHTML('📡','No Device Selected','Add a device in the sidebar.'); return; }
 
-function mixedContentWarningHTML(dev) {
-  if (location.protocol!=='https:') return '';
-  if (!isWledWS(dev)&&!isWledHT(dev)) return '';
-  const icon = dev.status==='online' ? '' :
-    `<div style="background:rgba(239,68,68,.1);border:1px solid var(--red);border-radius:4px;padding:10px 14px;margin-bottom:14px;font-size:10px;line-height:1.8;color:var(--red)">
-      <b>🔒 Mixed content blocked by browser</b><br>
-      Chrome 94+ has no popup. To unlock for this site:<br>
-      <span style="color:var(--text2)">
-        1. Click the <b>🔒 lock icon</b> in the address bar<br>
-        2. Choose <b>Site settings</b><br>
-        3. Set <b>Insecure content</b> → <b>Allow</b><br>
-        4. Reload this page
-      </span><br>
-      <span style="color:var(--dim)">(Firefox: click the shield icon in the address bar)</span>
-    </div>`;
-  return icon;
-}
+  const relays  = dev.relays || [];
+  const sensors = dev.sensors || [];
+  const online  = dev.status === 'online';
+  const active  = relays.filter(r => r.state).length;
 
-function renderDevice(id){
-  const main=document.getElementById('main'),dev=getDevice(id);
-  if(!dev){main.innerHTML=emptyHTML('📡','No Device Selected','Add a device in the sidebar.');return;}
-  const relays=dev.relays||[],online=dev.status==='online',active=relays.filter(r=>r.state).length,sensors=dev.sensors||[];
+  // HTTPS warning for WLED
+  const httpsWarn = isWled(dev) && IS_HTTPS ? `
+    <div class="wled-https-warn">
+      ⚠ <b>WLED WebSocket is blocked on HTTPS.</b><br>
+      GitHub Pages forces HTTPS, which prevents <code>ws://</code> connections to local devices.<br>
+      <b>Solutions:</b><br>
+      • Open <code>index.html</code> directly from your filesystem (drag into browser)<br>
+      • Run a local HTTP server: <code>npx serve .</code> or VS Code Live Server (<code>http://127.0.0.1:5500</code>)<br>
+      • Or host on any plain <b>HTTP</b> server on your network.
+    </div>` : '';
 
-  main.innerHTML=`
-    ${mixedContentWarningHTML(dev)}
+  main.innerHTML = `
+    ${httpsWarn}
     <div class="dev-header">
       <div>
-        <div class="dev-title">${esc(dev.name)}<span class="sub">${esc(isWledWS(dev)||isWledHT(dev)?dev.host:dev.prefix)}</span></div>
+        <div class="dev-title">${esc(dev.name)}<span class="sub">${isWled(dev) ? esc(dev.host||'') : esc(dev.prefix)}</span></div>
         <div class="dev-meta">
-          <span class="pill ${online?'pill-g':'pill-r'}">${online?'ONLINE':'OFFLINE'}</span>
-          ${protoBadgeHTML(dev)}
-          ${isWled(dev)&&dev.wledInfo?`<span class="pill pill-d">v${esc(dev.wledInfo.ver||'')}</span>`:''}
-          <span class="pill pill-a">${relays.length} ${isWled(dev)?'segs':'relays'}</span>
+          <span class="pill ${online?'pill-g':'pill-r'}" id="pill-status-${dev.id}">${online?'ONLINE':'OFFLINE'}</span>
+          ${isWled(dev) ? `<span class="pill" style="background:var(--teal);color:#000">${dev.hasMultiRelay?'WLED+Relays':'WLED'}</span>` : '<span class="pill pill-d">MQTT</span>'}
+          <span class="pill pill-a" id="pill-count-${dev.id}">${relays.length} ${isWled(dev)?'relays':'relays'}</span>
           <span class="pill ${active>0?'pill-a':'pill-d'}" id="pill-active-${dev.id}">${active} active</span>
-          ${sensors.length?`<span class="pill pill-d">${sensors.length} sensors</span>`:''}
+          ${!isWled(dev) && sensors.length ? `<span class="pill pill-teal">${sensors.length} sensors</span>` : ''}
           <span class="last-seen" id="last-seen-${dev.id}">${dev.lastSeen?'seen '+ago(dev.lastSeen):''}</span>
         </div>
       </div>
@@ -650,120 +361,538 @@ function renderDevice(id){
       </div>
     </div>
 
-    ${isWled(dev)?`
+    ${isWled(dev) ? `
     <div class="wled-global">
       <div class="wg-row">
         <span class="wg-lbl">MASTER</span>
         <label class="itoggle" style="margin-right:4px">
-          <input type="checkbox" ${dev.wledState?.on?'checked':''} onchange="wledMasterToggle('${dev.id}',this.checked)">
+          <input type="checkbox" ${dev.wledState?.on ? 'checked' : ''} onchange="wledMasterToggle('${dev.id}',this.checked)">
           <div class="itrack"><div class="ithumb"></div></div>
         </label>
-        ${dev.wledState?.color?`<span id="master-color-${dev.id}" style="width:14px;height:14px;border-radius:2px;background:${dev.wledState.color};border:1px solid var(--border);flex-shrink:0"></span>`:`<span id="master-color-${dev.id}"></span>`}
         <span class="wg-lbl">BRI</span>
-        <input type="range" min="0" max="255" value="${dev.wledState?.bri??128}" class="bri-slider" id="bri-master-${dev.id}"
+        <input type="range" min="0" max="255" value="${dev.wledState?.bri ?? 128}"
+          class="bri-slider" id="bri-master-${dev.id}"
           oninput="document.getElementById('bri-val-${dev.id}').textContent=this.value"
           onchange="wledBriCommit('${dev.id}',this.value)">
-        <span class="bri-val" id="bri-val-${dev.id}">${dev.wledState?.bri??128}</span>
-        ${!dev.isRelayCtrl&&dev.wledEffects?`
+        <span class="bri-val" id="bri-val-${dev.id}">${dev.wledState?.bri ?? 128}</span>
+        ${dev.wledEffects ? `
         <span class="wg-lbl" style="margin-left:8px">FX</span>
         <select class="fx-select" onchange="wledFxChange('${dev.id}',this.value)">
-          ${dev.wledEffects.filter(n=>n!=='RSVD'&&n!=='-').map((n,i)=>`<option value="${i}" ${(dev.relays?.[0]?.fx??0)===i?'selected':''}>${esc(n)}</option>`).join('')}
-        </select>
-        <span class="wg-lbl" style="margin-left:4px">SPD</span>
-        <input type="range" min="0" max="255" value="${dev.relays?.[0]?.sx??128}" class="bri-slider" style="width:70px"
-          onchange="wledSpeedChange('${dev.id}',this.value)">`:''}
+          ${dev.wledEffects.filter(n=>n!=='RSVD'&&n!=='-').map((n,i)=>`<option value="${i}">${esc(n)}</option>`).join('')}
+        </select>` : ''}
       </div>
-    </div>`:''}
+    </div>` : ''}
 
     <div class="cmd-bar">
       <div class="cmd-row">
         <span class="cmd-lbl">JSON CMD</span>
-        <input class="cmd-input" id="cmd-${dev.id}" placeholder='${isWled(dev)?'{"on":true}  ·  {"bri":128}  ·  {"seg":[{"id":0,"fx":73}]}':'{"on":true}  ·  {"relay":0,"on":true}'}'
+        <input class="cmd-input" id="cmd-${dev.id}"
+          placeholder='${isWled(dev) ? '{"on":true}  ·  {"bri":128}  ·  {"seg":[{"id":0,"fx":73}]}' : '{"on":true}  ·  {"relay":0,"on":true}'}'
           onkeydown="if(event.key==='Enter')sendCmd('${dev.id}')">
         <button class="btn btn-teal btn-sm" onclick="sendCmd('${dev.id}')">Send</button>
       </div>
       <div class="cmd-hints">
-        ${isWled(dev)?
-          `→ ${isWledHT(dev)?'POST /json/state':isWledWS(dev)?'WebSocket /ws':dev.prefix+'/api'} &nbsp;
-          <code>{"on":true}</code> <code>{"bri":200}</code> <code>{"seg":[{"id":0,"on":true}]}</code>`:
-          `<code>{"on":true}</code> <code>{"relay":0,"on":true}</code> <code>{"relay":1,"pulse":500}</code>`}
+        ${isWled(dev) ?
+          `LED: <code>{"on":true}</code> · <code>{"bri":128}</code> · <code>{"seg":[{"id":0,"fx":73}]}</code><br>
+          Relay toggle: click the relay card below` :
+          `All: <code>{"on":true}</code> · <code>{"on":false}</code> · Toggle: <code>{"on":"t"}</code><br>
+          Single: <code>{"relay":0,"on":true}</code> · Pulse: <code>{"relay":1,"pulse":500}</code>`
+        }
       </div>
     </div>
 
     <div class="relay-grid" id="grid-${dev.id}">
-      ${relays.length?relays.map(r=>cardHTML(dev,r)).join(''):emptyHTML('🔌','No data yet',online?'Click ↻ Ping to request state.':'Device offline.')}
+      ${relays.length ? relays.map(r => cardHTML(dev, r)).join('') : emptyHTML('🔌','No data yet', online ? 'Click ↻ Ping to request state.' : (isWled(dev) && IS_HTTPS ? 'HTTPS blocks WebSocket.' : 'Device is offline.'))}
     </div>
-    ${sensors.length?`<div style="margin-top:16px"><div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);margin-bottom:8px">Sensors</div><div style="display:flex;flex-wrap:wrap;gap:8px">${sensors.map(s=>`<div style="background:var(--panel2);border:1px solid var(--border);border-radius:3px;padding:6px 10px;font-size:11px;display:flex;align-items:center;gap:6px"><span class="sensor-dot ${s.state?'active':''}" id="sensor-dot-${dev.id}-${s.id}"></span>${esc(s.name)}</div>`).join('')}</div></div>`:''}`;
-}
 
-function cardHTML(dev,r){
-  const did=dev.id,rid=r.id,isOn=!!(r.on||r.state);
-  const showBri=isWled(dev)&&!dev.isRelayCtrl&&!isWledHT(dev);
-  const showPulse=!isWled(dev)||dev.isRelayCtrl||isWledHT(dev);
-  const fxName=showBri&&dev.wledEffects?(dev.wledEffects[r.fx??0]||null):null;
-  const colArr=Array.isArray(r.col)&&Array.isArray(r.col[0])?r.col[0]:null;
-  const colHex=colArr?'#'+colArr.slice(0,3).map(v=>(v||0).toString(16).padStart(2,'0')).join(''):null;
-  const label=r.name||(isWled(dev)?'Seg '+rid:'Relay '+(rid+1));
-  return `<div class="rcard ${isOn?'on':''}" id="rcard-${did}-${rid}">
-    <div class="rc-head">
-      <div class="rc-left"><span class="rc-num">${String(rid+1).padStart(2,'0')}</span>${colHex?`<span class="col-swatch" style="background:${colHex}"></span>`:''}<span class="rc-name">${esc(label)}</span></div>
-      <div class="rc-right">
-        ${fxName&&fxName!=='Solid'?`<span class="fx-badge">${esc(fxName)}</span>`:''}
-        <span class="spill ${isOn?'on':'off'}" id="rsp-${did}-${rid}">${isOn?'ON':'OFF'}</span>
-        <label class="itoggle"><input type="checkbox" ${isOn?'checked':''} onchange="toggleRelay('${did}',${rid},this.checked)"><div class="itrack"><div class="ithumb"></div></div></label>
+    ${!isWled(dev) && sensors.length ? `
+    <div class="sensor-section">
+      <div class="sensor-section-head">
+        <span class="sensor-section-title">⬡ Sensors</span>
+        <span class="sensor-section-count">${sensors.length} configured</span>
       </div>
-    </div>
-    ${showBri?`<div class="rc-bri"><span class="wg-lbl">BRI</span><input type="range" min="0" max="255" value="${r.bri??128}" class="bri-slider" oninput="this.nextElementSibling.textContent=this.value" onchange="wledSegBri('${did}',${rid},this.value)"><span class="bri-val">${r.bri??128}</span></div>`:''}
-    <div class="rc-body"><div class="rc-actions">
-      ${showPulse?`<div class="act-group"><input class="act-input" id="pm-${did}-${rid}" value="500" title="ms"><button class="act-btn" onclick="pulseRelay('${did}',${rid})">Pulse</button></div><div class="act-group"><input class="act-input" id="ts-${did}-${rid}" value="30" title="sec"><button class="act-btn" onclick="timerRelay('${did}',${rid})">Timer</button></div><span class="timer-badge ${r.timer>0?'v':''}" id="tbadge-${did}-${rid}">${r.timer>0?r.timer+'s':''}</span>`:''}
-    </div></div>
-  </div>`;
+      <div class="sensor-grid" id="sgrid-${dev.id}">
+        ${sensors.map(s => sensorCardHTML(dev, s)).join('')}
+      </div>
+    </div>` : ''}`;
 }
 
-function updateCard(dev,r){
-  const c=document.getElementById('rcard-'+dev.id+'-'+r.id);if(!c)return;
-  c.className='rcard'+(r.state?' on':'');
-  const cb=c.querySelector('input[type=checkbox]');if(cb)cb.checked=r.state;
-  const sp=document.getElementById('rsp-'+dev.id+'-'+r.id);
-  if(sp){sp.textContent=r.state?'ON':'OFF';sp.className='spill '+(r.state?'on':'off');}
+function cardHTML(dev, r) {
+  const did = dev.id, rid = r.id;
+  const isOn = !!(r.on || r.state);
+  const showBri   = isWled(dev) && !dev.hasMultiRelay;
+  const showPulse = !isWled(dev) || dev.hasMultiRelay;
+  const fxName    = showBri && dev.wledEffects ? (dev.wledEffects[r.fx ?? 0] || null) : null;
+  const colArr    = Array.isArray(r.col) && Array.isArray(r.col[0]) ? r.col[0] : null;
+  const colHex    = colArr ? '#' + colArr.slice(0,3).map(v => (v||0).toString(16).padStart(2,'0')).join('') : null;
+  const label     = r.name || (isWled(dev) ? 'Relay '+(rid+1) : 'Relay '+(rid+1));
+
+  return `
+    <div class="rcard ${isOn?'on':''}" id="rcard-${did}-${rid}">
+      <div class="rc-head">
+        <div class="rc-left">
+          <span class="rc-num">${String(rid+1).padStart(2,'0')}</span>
+          ${colHex ? `<span class="col-swatch" style="background:${colHex}" title="${colHex}"></span>` : ''}
+          <span class="rc-name">${esc(label)}</span>
+        </div>
+        <div class="rc-right">
+          ${fxName && fxName !== 'Solid' ? `<span class="fx-badge">${esc(fxName)}</span>` : ''}
+          <span class="spill ${isOn?'on':'off'}" id="rsp-${did}-${rid}">${isOn?'ON':'OFF'}</span>
+          <label class="itoggle">
+            <input type="checkbox" ${isOn?'checked':''} onchange="toggleRelay('${did}',${rid},this.checked)">
+            <div class="itrack"><div class="ithumb"></div></div>
+          </label>
+        </div>
+      </div>
+      ${showBri ? `
+      <div class="rc-bri">
+        <span class="wg-lbl">BRI</span>
+        <input type="range" min="0" max="255" value="${r.bri??128}" class="bri-slider"
+          oninput="this.nextElementSibling.textContent=this.value"
+          onchange="wledSegBri('${did}',${rid},this.value)">
+        <span class="bri-val">${r.bri??128}</span>
+      </div>` : ''}
+      <div class="rc-body">
+        <div class="rc-actions">
+          ${showPulse ? `
+          <div class="act-group">
+            <input class="act-input" id="pm-${did}-${rid}" value="500" title="ms">
+            <button class="act-btn" onclick="pulseRelay('${did}',${rid})">Pulse</button>
+          </div>
+          <div class="act-group">
+            <input class="act-input" id="ts-${did}-${rid}" value="30" title="sec">
+            <button class="act-btn" onclick="timerRelay('${did}',${rid})">Timer</button>
+          </div>
+          <span class="timer-badge ${r.timer>0?'v':''}" id="tbadge-${did}-${rid}">${r.timer>0?r.timer+'s':''}</span>
+          ` : ''}
+        </div>
+      </div>
+    </div>`;
 }
-function updateMeta(dev){
-  if(activeId!==dev.id)return;
-  const a=(dev.relays||[]).filter(r=>r.state).length;
-  const p=document.getElementById('pill-active-'+dev.id);
-  if(p){p.textContent=a+' active';p.className='pill '+(a>0?'pill-a':'pill-d');}
+
+function updateCard(dev, r) {
+  const card = document.getElementById('rcard-'+dev.id+'-'+r.id);
+  if (!card) return;
+  card.className = 'rcard' + (r.state?' on':'');
+  const cb = card.querySelector('input[type=checkbox]');
+  if (cb) cb.checked = r.state;
+  const sp = document.getElementById('rsp-'+dev.id+'-'+r.id);
+  if (sp) { sp.textContent = r.state?'ON':'OFF'; sp.className = 'spill '+(r.state?'on':'off'); }
+}
+
+function updateMeta(dev) {
+  if (activeId !== dev.id) return;
+  const relays = dev.relays || [];
+  const active = relays.filter(r => r.state).length;
+  const pa = document.getElementById('pill-active-'+dev.id);
+  if (pa) { pa.textContent = active+' active'; pa.className = 'pill '+(active>0?'pill-a':'pill-d'); }
+}
+
+/* ══════════════════════════════════════════
+   SENSOR CARDS
+══════════════════════════════════════════ */
+function sensorCardHTML(dev, s) {
+  const active = !!s.active;
+  const modeStr = s.trigger_mode && s.trigger_mode !== 'NONE' && s.trigger_relay >= 0
+    ? `→ R${s.trigger_relay + 1} · ${s.trigger_mode}` : '';
+  return `
+    <div class="scrd ${active ? 'active' : ''}" id="scrd-${dev.id}-${s.id}">
+      <div class="scrd-head">
+        <span class="scrd-num">${String(s.id + 1).padStart(2,'0')}</span>
+        <span class="scrd-name">${esc(s.name || ('Sensor '+(s.id+1)))}</span>
+        <span class="scrd-pill ${active ? 'active' : 'idle'}" id="scpill-${dev.id}-${s.id}">${active ? 'ACTIVE' : 'IDLE'}</span>
+      </div>
+      ${s.pin !== undefined ? `<div class="scrd-meta">GPIO ${s.pin}${s.debounce_ms > 0 ? ` · ⏱${s.debounce_ms}ms` : ''}${modeStr ? ` · ${modeStr}` : ''}</div>` : ''}
+    </div>`;
+}
+
+function updateSensorCard(dev, s) {
+  const card = document.getElementById('scrd-'+dev.id+'-'+s.id);
+  if (!card) return;
+  const active = !!s.active;
+  card.className = 'scrd' + (active ? ' active' : '');
+  const pill = document.getElementById('scpill-'+dev.id+'-'+s.id);
+  if (pill) { pill.textContent = active ? 'ACTIVE' : 'IDLE'; pill.className = 'scrd-pill ' + (active ? 'active' : 'idle'); }
+}
+
+/* ══════════════════════════════════════════
+   WLED — DIRECT WEBSOCKET
+   ─────────────────────────────────────────
+   State:   ws://host/ws  (WebSocket)
+   Control: http://host/relays?switch=…  (HTTP fetch for relays)
+            ws send JSON for LED state
+   Polling: periodic {v:1} ping over WS
+
+   ⚠ BLOCKED on HTTPS (GitHub Pages).
+     Open via HTTP — local server or filesystem.
+     The MQTT broker section is still used for
+     relay controllers only.
+══════════════════════════════════════════ */
+function isWled(dev) { return (dev?.type || 'mqtt') === 'wled'; }
+
+function wledConnect(dev) {
+  if (!dev.host) { console.warn('[WLED] no host set'); return; }
+  if (IS_HTTPS) { dev.status = 'blocked'; renderSidebar(); if (activeId === dev.id) renderDevice(dev.id); return; }
+  wledDisconnect(dev);
+
+  let ws;
+  try { ws = new WebSocket('ws://' + dev.host + '/ws'); }
+  catch(e) { console.warn('[WLED] WS open error', e); scheduleReconnect(dev); return; }
+
+  wledSockets[dev.id] = ws;
+
+  ws.onopen = () => {
+    dev.status = 'online'; dev.lastSeen = Date.now();
+    renderSidebar(); if (activeId === dev.id) renderDevice(dev.id);
+    // Request full state + effects list
+    try { ws.send(JSON.stringify({ v: 1 })); } catch {}
+  };
+
+  ws.onmessage = (e) => {
+    try { handleWledState(dev, JSON.parse(e.data)); } catch {}
+  };
+
+  ws.onclose = () => {
+    dev.status = 'offline';
+    delete wledSockets[dev.id];
+    renderSidebar(); if (activeId === dev.id) renderDevice(dev.id);
+    scheduleReconnect(dev);
+  };
+
+  ws.onerror = () => { dev.status = 'offline'; };
+
+  // Periodic state ping (fallback if WLED doesn't push changes)
+  if (wledPollers[dev.id]) clearInterval(wledPollers[dev.id]);
+  wledPollers[dev.id] = setInterval(() => {
+    const s = wledSockets[dev.id];
+    if (s && s.readyState === WebSocket.OPEN) {
+      try { s.send(JSON.stringify({ v: 1 })); } catch {}
+    }
+  }, 5000);
+}
+
+function scheduleReconnect(dev) {
+  if (wledPollers[dev.id]) clearInterval(wledPollers[dev.id]);
+  wledPollers[dev.id] = setTimeout(() => {
+    if (devices.find(d => d.id === dev.id)) wledConnect(dev);
+  }, 5000);
+}
+
+function wledDisconnect(dev) {
+  const ws = wledSockets[dev.id];
+  if (ws) { ws.onclose = null; try { ws.close(); } catch {} delete wledSockets[dev.id]; }
+  if (wledPollers[dev.id]) { clearInterval(wledPollers[dev.id]); clearTimeout(wledPollers[dev.id]); delete wledPollers[dev.id]; }
+  dev.status = 'offline';
+}
+
+function wledRequestState(dev) {
+  const ws = wledSockets[dev.id];
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify({ v: 1 })); toast('Requesting state…'); } catch {}
+  } else if (!IS_HTTPS) {
+    toast('Reconnecting…'); wledConnect(dev);
+  }
+}
+
+function handleWledState(dev, data) {
+  dev.lastSeen = Date.now();
+  dev.status   = 'online';
+  if (!dev.wledState) dev.wledState = {};
+
+  // Effects list (sent once on connect)
+  if (data.effects) dev.wledEffects = data.effects;
+
+  // LED global state
+  const state = data.state || data;
+  if (state.on  !== undefined) dev.wledState.on  = state.on;
+  if (state.bri !== undefined) dev.wledState.bri = state.bri;
+
+  // MultiRelay usermod — physical relay states
+  const mr = state.MultiRelay || (data.state && data.state.MultiRelay);
+  if (mr && Array.isArray(mr.relays)) {
+    dev.hasMultiRelay = true;
+    // Build/merge relay list preserving order by relay index
+    const existing = dev.relays || [];
+    dev.relays = mr.relays.map(r => {
+      const old = existing.find(x => x.id === r.relay) || {};
+      return {
+        id:    r.relay,
+        name:  old.name || ('Relay ' + (r.relay + 1)),
+        on:    !!r.state,
+        state: !!r.state,
+        bri:   255,
+        col:   null,
+        timer: 0
+      };
+    });
+  } else if (!dev.hasMultiRelay) {
+    // Fall back to LED segments for state display
+    const segs = state.seg || [];
+    if (segs.length) {
+      dev.relays = segs.map(s => ({
+        id:    s.id,
+        name:  s.n || ('Seg ' + s.id),
+        on:    !!s.on,
+        state: !!s.on,
+        bri:   s.bri ?? 128,
+        col:   s.col || null,
+        timer: 0
+      }));
+    } else if (!dev.relays?.length) {
+      dev.relays = [{ id:0, name:'Master', on:dev.wledState.on, state:dev.wledState.on, bri:dev.wledState.bri??128, col:null, timer:0 }];
+    }
+  }
+
+  renderSidebar();
+  if (activeId === dev.id) renderDevice(dev.id);
+}
+
+/* ── WLED LED control (WebSocket) ── */
+function wledWsSend(dev, obj) {
+  const ws = wledSockets[dev.id];
+  if (!ws || ws.readyState !== WebSocket.OPEN) { toast('WLED not connected', 'r'); return false; }
+  try { ws.send(JSON.stringify(obj)); return true; } catch(e) { toast('Send error: '+e.message, 'r'); return false; }
+}
+
+function wledMasterToggle(devId, on) {
+  const dev = getDevice(devId); if (!dev) return;
+  if (!dev.wledState) dev.wledState = {};
+  dev.wledState.on = on;
+  wledWsSend(dev, { on });
+}
+
+function wledBriCommit(devId, val) {
+  const dev = getDevice(devId); if (!dev) return;
+  const bri = parseInt(val);
+  if (!dev.wledState) dev.wledState = {};
+  dev.wledState.bri = bri;
+  wledWsSend(dev, { bri });
+}
+
+function wledFxChange(devId, fx) {
+  const dev = getDevice(devId); if (!dev) return;
+  wledWsSend(dev, { seg: [{ id: 0, fx: parseInt(fx) }] });
+}
+
+function wledSegBri(devId, segId, val) {
+  const dev = getDevice(devId); if (!dev) return;
+  wledWsSend(dev, { seg: [{ id: segId, bri: parseInt(val) }] });
+}
+
+/* ── WLED relay control (HTTP /relays endpoint) ── */
+async function wledFetch(dev, path, method='GET', body=null) {
+  if (IS_HTTPS) { toast('HTTPS blocks HTTP requests to local devices', 'r'); return null; }
+  try {
+    const opts = { method };
+    if (body) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
+    const res = await fetch('http://' + dev.host + path, opts);
+    if (res.ok) return res;
+    return null;
+  } catch(e) {
+    dev.status = 'offline'; renderSidebar(); if (activeId === dev.id) renderDevice(dev.id);
+    toast('WLED unreachable', 'r'); return null;
+  }
+}
+
+function buildSwitchStr(dev, overrideId, overrideVal) {
+  // Build comma-separated switch string from current relay states
+  const relays = dev.relays || [];
+  if (!relays.length) return overrideVal ? '1' : '0';
+  return relays.map(r => r.id === overrideId ? (overrideVal ? 1 : 0) : (r.on ? 1 : 0)).join(',');
+}
+
+function toggleRelayWled(devId, relayId, on) {
+  const dev = getDevice(devId); if (!dev) return;
+  const sw = buildSwitchStr(dev, relayId, on);
+  wledFetch(dev, '/relays?switch=' + sw);
+  const r = dev.relays?.find(r => r.id === relayId);
+  if (r) { r.on = on; r.state = on; updateCard(dev, r); updateMeta(dev); }
+}
+
+function pulseRelayWled(devId, relayId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const ms = parseInt(document.getElementById('pm-'+devId+'-'+relayId).value) || 500;
+  const swOn  = buildSwitchStr(dev, relayId, true);
+  const swOff = buildSwitchStr(dev, relayId, false);
+  wledFetch(dev, '/relays?switch=' + swOn);
+  setTimeout(() => wledFetch(dev, '/relays?switch=' + swOff), ms);
+  const r = dev.relays?.find(r => r.id === relayId);
+  if (r) { r.on = true; r.state = true; updateCard(dev, r); updateMeta(dev); }
+  toast('Pulse ' + ms + 'ms → ' + dev.name + ' R' + (relayId + 1));
+}
+
+function timerRelayWled(devId, relayId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const s   = parseInt(document.getElementById('ts-'+devId+'-'+relayId).value) || 30;
+  const swOn  = buildSwitchStr(dev, relayId, true);
+  const swOff = buildSwitchStr(dev, relayId, false);
+  wledFetch(dev, '/relays?switch=' + swOn);
+  setTimeout(() => wledFetch(dev, '/relays?switch=' + swOff), s * 1000);
+  const r = dev.relays?.find(r => r.id === relayId);
+  if (r) { r.on = true; r.state = true; updateCard(dev, r); updateMeta(dev); }
+  toast('Timer ' + s + 's → ' + dev.name + ' R' + (relayId + 1));
+}
+
+function allOffWled(devId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const n = dev.relays?.length || 4;
+  wledFetch(dev, '/relays?switch=' + Array(n).fill(0).join(','));
+  dev.relays?.forEach(r => { r.on = false; r.state = false; updateCard(dev, r); });
+  updateMeta(dev); toast('All OFF — ' + dev.name, 'r');
+}
+
+function allOnWled(devId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const n = dev.relays?.length || 4;
+  wledFetch(dev, '/relays?switch=' + Array(n).fill(1).join(','));
+  dev.relays?.forEach(r => { r.on = true; r.state = true; updateCard(dev, r); });
+  updateMeta(dev); toast('All ON — ' + dev.name);
+}
+
+function sendCmdWled(devId) {
+  const dev = getDevice(devId); if (!dev) return;
+  const raw = document.getElementById('cmd-'+devId).value.trim();
+  if (!raw) return;
+  try {
+    const obj = JSON.parse(raw);
+    wledWsSend(dev, obj);
+    toast('Sent via WebSocket', 'g');
+  } catch(e) { toast('Invalid JSON: ' + e.message, 'r'); }
+}
+
+/* ── Modal type toggle ── */
+function onDevTypeChange() {
+  const type = document.getElementById('dm-type').value;
+  document.getElementById('dm-mqtt-fields').style.display = type === 'mqtt' ? '' : 'none';
+  document.getElementById('dm-wled-fields').style.display = type === 'wled' ? '' : 'none';
+}
+
+/* ── DEVICE MANAGEMENT ── */
+function getDevice(id) { return devices.find(d => d.id === id); }
+
+function openAddDevice() {
+  document.getElementById('modal-title').textContent = 'Add Device';
+  document.getElementById('dm-id').value       = '';
+  document.getElementById('dm-name').value     = '';
+  document.getElementById('dm-type').value     = 'mqtt';
+  document.getElementById('dm-prefix').value   = '';
+  document.getElementById('dm-ping').value     = '10';
+  document.getElementById('dm-wled-host').value = '';
+  onDevTypeChange();
+  document.getElementById('add-modal').classList.add('open');
+  setTimeout(() => document.getElementById('dm-name').focus(), 100);
+}
+
+function openEditDevice(id) {
+  const dev = getDevice(id); if (!dev) return;
+  document.getElementById('modal-title').textContent = 'Edit Device';
+  document.getElementById('dm-id').value       = dev.id;
+  document.getElementById('dm-name').value     = dev.name;
+  document.getElementById('dm-type').value     = dev.type || 'mqtt';
+  document.getElementById('dm-prefix').value   = dev.prefix || '';
+  document.getElementById('dm-ping').value     = dev.pingInterval || 10;
+  document.getElementById('dm-wled-host').value = dev.host || '';
+  onDevTypeChange();
+  document.getElementById('add-modal').classList.add('open');
+}
+
+function closeModal() { document.getElementById('add-modal').classList.remove('open'); }
+
+function saveDevice() {
+  const existingId = document.getElementById('dm-id').value;
+  const name    = document.getElementById('dm-name').value.trim() || 'Device';
+  const type    = document.getElementById('dm-type').value || 'mqtt';
+  const prefix  = document.getElementById('dm-prefix').value.trim().replace(/\/+$/,'') || 'home/relay';
+  const ping    = parseInt(document.getElementById('dm-ping').value) || 10;
+  const host    = document.getElementById('dm-wled-host').value.trim();
+
+  if (type === 'wled' && !host) { toast('Enter WLED IP address', 'r'); return; }
+
+  if (existingId) {
+    const dev = getDevice(existingId);
+    if (dev) {
+      if ((dev.type||'mqtt') === 'mqtt') { unsubscribeDevice(dev); if (pingTimers[dev.id]) { clearInterval(pingTimers[dev.id]); delete pingTimers[dev.id]; } }
+      else if (dev.type === 'wled') { wledDisconnect(dev); }
+      dev.name = name; dev.type = type; dev.prefix = prefix; dev.pingInterval = ping; dev.host = host;
+      if (type === 'mqtt' && connected) { subscribeDevice(dev); startPing(dev); }
+      if (type === 'wled') wledConnect(dev);
+    }
+  } else {
+    const dev = { id:'dev-'+Date.now(), name, type, prefix, pingInterval:ping, host, status:'offline', lastSeen:null, relays:[] };
+    devices.push(dev);
+    if (type === 'mqtt' && connected) { subscribeDevice(dev); publishPresence(dev, true); startPing(dev); }
+    if (type === 'wled') wledConnect(dev);
+    selectDevice(dev.id);
+  }
+
+  persist(); renderSidebar(); closeModal(); toast('Saved', 'g');
+}
+
+function removeDevice(id, e) {
+  if (e) e.stopPropagation();
+  const dev = getDevice(id); if (!dev) return;
+  if (!confirm('Remove "'+dev.name+'"?')) return;
+  if ((dev.type||'mqtt') === 'mqtt') {
+    unsubscribeDevice(dev); publishPresence(dev, false);
+    if (pingTimers[id]) { clearInterval(pingTimers[id]); delete pingTimers[id]; }
+  } else { wledDisconnect(dev); }
+  devices = devices.filter(d => d.id !== id);
+  if (activeId === id) activeId = devices[0]?.id || null;
+  persist(); renderSidebar();
+  if (activeId) renderDevice(activeId);
+  else document.getElementById('main').innerHTML = emptyHTML('📡','No Device Selected','Add a device in the sidebar.');
 }
 
 /* ── HELPERS ── */
-function ago(ts){const s=Math.floor((Date.now()-ts)/1000);if(s<5)return'just now';if(s<60)return s+'s ago';return Math.floor(s/60)+'m ago';}
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-function emptyHTML(icon,title,sub){return`<div class="empty"><div class="empty-icon">${icon}</div><div class="empty-title">${title}</div><div class="empty-sub">${sub}</div></div>`;}
-setInterval(()=>{devices.forEach(d=>{const e=document.getElementById('last-seen-'+d.id);if(e&&d.lastSeen)e.textContent='seen '+ago(d.lastSeen);});},10000);
+function persist() {
+  save({ broker, devices: devices.map(({id,name,type,prefix,pingInterval,host}) => ({id,name,type:type||'mqtt',prefix,pingInterval,host:host||''})) });
+}
+
+function ago(ts) {
+  const s = Math.floor((Date.now()-ts)/1000);
+  if (s < 5)  return 'just now';
+  if (s < 60) return s+'s ago';
+  return Math.floor(s/60)+'m ago';
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function emptyHTML(icon, title, sub) {
+  return `<div class="empty"><div class="empty-icon">${icon}</div><div class="empty-title">${title}</div><div class="empty-sub">${sub}</div></div>`;
+}
+
+setInterval(() => {
+  devices.forEach(dev => {
+    const el = document.getElementById('last-seen-'+dev.id);
+    if (el && dev.lastSeen) el.textContent = 'seen '+ago(dev.lastSeen);
+  });
+}, 10000);
 
 /* ── INIT ── */
-(function init(){
-  const mustSSL=location.protocol==='https:';
-  document.getElementById('b-host').value =broker.host||'broker.hivemq.com';
-  document.getElementById('b-port').value =broker.port||(mustSSL?8884:9001);
-  document.getElementById('b-user').value =broker.user||'';
-  document.getElementById('b-pass').value =broker.pass||'';
-  document.getElementById('b-ssl').checked=mustSSL||broker.ssl||false;
-  if(mustSSL){
-    document.getElementById('b-ssl').disabled=true;
-    const n=document.createElement('div');
-    n.style.cssText='font-size:9px;color:var(--amber);margin-top:6px;line-height:1.7';
-    n.innerHTML='⚠ HTTPS page: MQTT needs WSS broker.<br>WLED WS/HTTP: unlock via 🔒 → Site settings → Insecure content → Allow';
-    document.getElementById('b-ssl').closest('.broker-panel').appendChild(n);
+(function init() {
+  const mustSSL = IS_HTTPS;
+  document.getElementById('b-host').value  = broker.host || (mustSSL ? 'broker.hivemq.com' : '');
+  document.getElementById('b-port').value  = broker.port || (mustSSL ? 8884 : 9001);
+  document.getElementById('b-user').value  = broker.user || '';
+  document.getElementById('b-pass').value  = broker.pass || '';
+  document.getElementById('b-ssl').checked = mustSSL || broker.ssl || false;
+  if (mustSSL) {
+    document.getElementById('b-ssl').disabled = true;
+    document.getElementById('https-note').style.display = '';
   }
-  setConnUI(false);renderSidebar();
-  devices.forEach(dev=>{
-    if(isWledWS(dev)) setTimeout(()=>wledConnect(dev),300+devices.indexOf(dev)*100);
-    if(isWledHT(dev)) setTimeout(()=>wledHttpStart(dev),300+devices.indexOf(dev)*100);
-  });
-  if(!activeId&&devices.length)activeId=devices[0].id;
-  if(activeId)renderDevice(activeId);
-  else document.getElementById('main').innerHTML=emptyHTML('📡','No Device Selected',
-    '<b>Relay Controller / WLED (MQTT)</b> — needs broker, works everywhere.<br>'+
-    '<b>WLED (WebSocket)</b> — direct ws://, no broker. On HTTPS: 🔒 → Site settings → Insecure content → Allow.<br>'+
-    '<b>WLED (HTTP Poll)</b> — same as your existing fetch page. Polls /json every few sec.');
+
+  // Show global HTTPS warning banner if needed
+  const banner = document.getElementById('https-global-warn');
+  if (banner && IS_HTTPS) banner.style.display = '';
+
+  setConnUI(false);
+  renderSidebar();
+
+  // Connect WLED devices immediately (WebSocket, no broker needed)
+  devices.filter(d => d.type === 'wled').forEach(wledConnect);
+
+  if (!activeId && devices.length) activeId = devices[0].id;
+  if (activeId) renderDevice(activeId);
+  else document.getElementById('main').innerHTML = emptyHTML('📡','No Device Selected',
+    'Add a relay controller (needs MQTT broker) or a WLED device (direct WebSocket — HTTP only).');
 })();
