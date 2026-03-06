@@ -207,3 +207,4 @@ body::after {
 #toast.show.g { border-color:var(--green); color:var(--green); }
 #toast.show.r { border-color:var(--red); color:var(--red); }
 .dev-badge.wled-ws { background:var(--purple); color:#fff; }
+.dev-badge.wled-http { background:var(--amber); color:#000; }

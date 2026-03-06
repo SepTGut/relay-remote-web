@@ -1,25 +1,38 @@
-# Relay Ctrl — Remote Dashboard
+# Relay Ctrl Remote Dashboard
 
-Controls ESP32 Relay Controllers and WLED devices from any browser.
+## Transport Options
 
-## Device Types
+| Device Type | Protocol | GitHub Pages HTTPS | Local HTTP |
+|-------------|----------|-------------------|------------|
+| Relay Controller (MQTT) | MQTT WSS | ✅ Works | ✅ Works |
+| WLED (MQTT) | MQTT WSS | ✅ Works | ✅ Works |
+| WLED (WebSocket) | ws:// direct | ⚠ Needs unlock | ✅ Works |
+| WLED (HTTP Poll) | http:// fetch | ⚠ Needs unlock | ✅ Works |
 
-| Type | Protocol | Broker needed | Local network needed | HTTPS compatible |
-|------|----------|---------------|----------------------|------------------|
-| Relay Controller | MQTT over WSS | ✅ Yes | ❌ No | ✅ Yes |
-| WLED (MQTT) | MQTT over WSS | ✅ Yes | ❌ No | ✅ Yes |
-| WLED (WebSocket) | ws:// direct | ❌ No | ✅ Yes | ⚠ Browser asks once |
+## Unlock Mixed Content in Chrome (for WS / HTTP Poll on HTTPS)
 
-**WLED WebSocket on HTTPS:** browser shows a "mixed content" permission prompt once — same as when you allow `fetch(http://)`. Accept it and WebSocket works normally.
+Chrome 94+ removed the popup. Manual steps:
+1. Click the **🔒 lock icon** in address bar
+2. Click **Site settings**
+3. Find **Insecure content** → set to **Allow**
+4. Reload the page
 
-## MQTT Broker (for Relay + WLED-MQTT)
+Firefox: click the **shield icon** in address bar → disable protection for this site.
 
-Free public broker for testing: `broker.hivemq.com` port `8884` (WSS)
+## MQTT Broker
 
-## WLED Setup
+Free public broker for testing: `broker.hivemq.com` port `8884` (WSS/TLS)
 
-### WLED via MQTT
-Settings → Sync Interfaces → MQTT — set same broker + topic prefix.
+## WLED MQTT Setup
 
-### WLED via WebSocket
-Just enter the IP/hostname. No WLED config needed — connects to `/ws` directly.
+WLED → Settings → Sync Interfaces → MQTT:
+- Set same broker host and port
+- Set a Topic (prefix), e.g. `wled/mystrip`
+- Add same prefix in dashboard as WLED (MQTT) device
+
+## WLED HTTP Poll
+
+Same API as your standalone relay control page:
+- Reads state from `GET /json`
+- Toggles via `GET /relays?switch=0,1,0,1`
+- JSON control via `POST /json/state`
