@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════
    RELAY CTRL — REMOTE DASHBOARD  (remote.js)
    MQTT over WebSocket (Paho) for relay controllers.
-   Direct WebSocket for WLED devices — HTTP only.
+   Direct WebSocket for WLED devices — HTTP only..
 ═══════════════════════════════════════════════════ */
 
 /* ── STORAGE ── */
