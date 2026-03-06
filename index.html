@@ -1,4 +1,3 @@
-<!--Ver. 0.1.1-->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10,15 +9,6 @@
 <link rel="stylesheet" href="remote.css">
 </head>
 <body>
-
-<!-- Global HTTPS warning — shown only when hosted on HTTPS (e.g. GitHub Pages) -->
-<div id="https-global-warn" style="display:none;background:#1a0a00;border-bottom:2px solid #f59e0b;padding:10px 18px;font-size:11px;font-family:monospace;color:#fcd34d;line-height:1.8">
-  ⚠ <strong>HTTPS detected (GitHub Pages).</strong>
-  Relay controllers work fine via MQTT → WSS.
-  WLED devices need WebSocket (<code>ws://</code>) which is <strong>blocked by the browser on HTTPS</strong>.<br>
-  To use WLED: open this page from a local HTTP server —
-  <code>npx serve .</code> &nbsp;or&nbsp; VS Code Live Server &nbsp;or&nbsp; <code>python -m http.server</code>.
-</div>
 
 <header id="topbar">
   <div class="logo-mark">
@@ -104,15 +94,20 @@
         </div>
       </div>
 
-      <!-- WLED direct WebSocket fields -->
+      <!-- WLED direct WebSocket + MQTT fallback fields -->
       <div id="dm-wled-fields" style="display:none">
         <div class="field">
           <label>WLED IP Address</label>
-          <input type="text" id="dm-wled-host" placeholder="192.168.1.x">
+          <input type="text" id="dm-wled-host" placeholder="192.168.1.10">
+          <div class="hint">Used for direct WebSocket on HTTP. Leave blank if HTTP only.</div>
+        </div>
+        <div class="field">
+          <label>MQTT Device Topic <span style="color:var(--dim)">(for GitHub Pages / HTTPS)</span></label>
+          <input type="text" id="dm-wled-topic" placeholder="wled/XXXXXX">
           <div class="hint">
-            Connects via <code>ws://&lt;ip&gt;/ws</code> — direct WebSocket.<br>
-            Works on HTTP. <strong>Blocked by browser on HTTPS (GitHub Pages).</strong><br>
-            For GitHub Pages, use a relay controller instead (MQTT).
+            Set in WLED → Config → Sync → MQTT → Device Topic.<br>
+            Used automatically when WebSocket is unavailable (HTTPS).<br>
+            Broker must be connected in the sidebar.
           </div>
         </div>
       </div>
