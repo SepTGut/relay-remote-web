@@ -7,25 +7,18 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Barlow+Condensed:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="remote.css">
+<style>
+  .sensor-dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex-shrink:0;transition:all .3s;}
+  .sensor-dot.active{background:var(--teal);box-shadow:0 0 6px var(--teal);}
+  .dev-badge.wled-ws{background:var(--purple);color:#fff;}
+</style>
 </head>
 <body>
-
-<!-- Global HTTPS warning — shown only when hosted on HTTPS (e.g. GitHub Pages) -->
-<div id="https-global-warn" style="display:none;background:#1a0a00;border-bottom:2px solid #f59e0b;padding:10px 18px;font-size:11px;font-family:monospace;color:#fcd34d;line-height:1.8">
-  ⚠ <strong>HTTPS detected (GitHub Pages).</strong>
-  Relay controllers work fine via MQTT → WSS.
-  WLED devices need WebSocket (<code>ws://</code>) which is <strong>blocked by the browser on HTTPS</strong>.<br>
-  To use WLED: open this page from a local HTTP server —
-  <code>npx serve .</code> &nbsp;or&nbsp; VS Code Live Server &nbsp;or&nbsp; <code>python -m http.server</code>.
-</div>
 
 <header id="topbar">
   <div class="logo-mark">
     <div class="logo-icon">⚡</div>
-    <div>
-      <div class="logo-text">Relay Ctrl</div>
-      <div class="logo-sub">Remote · MQTT/WS</div>
-    </div>
+    <div><div class="logo-text">Relay Ctrl</div><div class="logo-sub">Remote · MQTT</div></div>
   </div>
   <div class="tb-div"></div>
   <div class="tb-stat"><div class="tb-lbl">Broker</div><div class="tb-val" id="tb-status">DISCONNECTED</div></div>
@@ -38,21 +31,17 @@
 </header>
 
 <div id="body">
-
   <nav id="sidebar">
     <div class="broker-panel">
-      <div class="sec-label" style="padding:0 0 10px">MQTT Broker <span style="color:var(--dim);font-size:9px">(relay controllers)</span></div>
+      <div class="sec-label" style="padding:0 0 10px">MQTT Broker</div>
       <div class="field"><label>Host</label><input type="text" id="b-host" placeholder="broker.hivemq.com"></div>
       <div class="frow">
-        <div class="field"><label>WS Port</label><input type="number" id="b-port" value="9001"></div>
+        <div class="field"><label>WS Port</label><input type="number" id="b-port" value="8884"></div>
         <div class="field" style="display:flex;align-items:flex-end;padding-bottom:2px">
           <label style="display:flex;align-items:center;gap:5px;color:var(--text);white-space:nowrap">
-            <input type="checkbox" id="b-ssl" style="width:auto">TLS/SSL
+            <input type="checkbox" id="b-ssl" style="width:auto"> TLS/WSS
           </label>
         </div>
-      </div>
-      <div id="https-note" style="display:none;font-size:10px;color:var(--amber);margin-bottom:6px;line-height:1.5">
-        ⚠ HTTPS page — TLS forced.<br>Use port <b>8884</b> for HiveMQ WSS.
       </div>
       <div class="field"><label>Username <span style="color:var(--dim)">(optional)</span></label><input type="text" id="b-user"></div>
       <div class="field"><label>Password</label><input type="password" id="b-pass" placeholder="••••••••"></div>
@@ -60,9 +49,8 @@
         <button class="btn btn-amber btn-full" id="btn-connect" onclick="mqttConnect()">⚡ Connect</button>
         <button class="btn btn-red btn-full" id="btn-disconnect" style="display:none" onclick="mqttDisconnect()">✕ Disc.</button>
       </div>
-      <div id="conn-error" style="display:none;margin-top:8px;font-size:10px;color:var(--red);line-height:1.5"></div>
+      <div id="conn-error" style="display:none;margin-top:8px;font-size:9px;color:var(--red);line-height:1.6"></div>
     </div>
-
     <span class="sec-label">Devices</span>
     <div class="device-list" id="device-list"></div>
     <button class="add-dev-btn" onclick="openAddDevice()">+ Add Device</button>
@@ -80,41 +68,69 @@
     </div>
     <div class="modal-body">
       <input type="hidden" id="dm-id">
-      <div class="field"><label>Device Name</label><input type="text" id="dm-name" placeholder="e.g. Greenhouse, Workshop"></div>
+
+      <div class="field">
+        <label>Device Name</label>
+        <input type="text" id="dm-name" placeholder="e.g. Greenhouse, LED Strip">
+      </div>
+
       <div class="field">
         <label>Device Type</label>
-        <select id="dm-type" onchange="onDevTypeChange()" style="width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--text2);font-family:var(--mono);font-size:11px;padding:6px 8px;border-radius:3px;outline:none">
+        <select id="dm-type" onchange="onDevTypeChange()"
+          style="width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--text2);font-family:var(--mono);font-size:11px;padding:6px 8px;border-radius:3px;outline:none">
           <option value="mqtt">Relay Controller (MQTT)</option>
-          <option value="wled">WLED Device (Direct WebSocket)</option>
+          <option value="wled">WLED Device (MQTT)</option>
+          <option value="wled-ws">WLED Device (WebSocket)</option>
         </select>
       </div>
 
-      <!-- MQTT relay controller fields -->
+      <!-- MQTT / WLED-MQTT fields -->
       <div id="dm-mqtt-fields">
         <div class="field">
-          <label>Topic Prefix</label>
+          <label>MQTT Topic Prefix</label>
           <input type="text" id="dm-prefix" placeholder="home/relay">
-          <div class="hint">Must match the prefix in ESP32 firmware config.</div>
+          <div class="hint" id="dm-prefix-hint">Match the prefix in ESP32 firmware config.</div>
         </div>
         <div class="field">
           <label>Ping Interval (sec)</label>
           <input type="number" id="dm-ping" value="10" min="2" max="300">
-          <div class="hint">How often to request state from the device.</div>
+          <div class="hint">How often to poll state from the device.</div>
         </div>
       </div>
 
-      <!-- WLED direct WebSocket fields -->
-      <div id="dm-wled-fields" style="display:none">
+      <!-- WebSocket-only fields -->
+      <div id="dm-ws-fields" style="display:none">
         <div class="field">
-          <label>WLED IP Address</label>
-          <input type="text" id="dm-wled-host" placeholder="192.168.1.x">
-          <div class="hint">
-            Connects via <code>ws://&lt;ip&gt;/ws</code> — direct WebSocket.<br>
-            Works on HTTP. <strong>Blocked by browser on HTTPS (GitHub Pages).</strong><br>
-            For GitHub Pages, use a relay controller instead (MQTT).
-          </div>
+          <label>WLED IP / Hostname</label>
+          <input type="text" id="dm-host" placeholder="192.168.1.x  or  wled.local">
+          <div class="hint">Device must be reachable from this browser on the local network.</div>
+        </div>
+        <div class="field">
+          <label>Poll Interval (sec, 0 = push only)</label>
+          <input type="number" id="dm-poll" value="0" min="0" max="300">
+          <div class="hint">WLED pushes state on every change automatically.</div>
         </div>
       </div>
+
+      <!-- WLED note (shown for both WLED types) -->
+      <div id="dm-wled-note" style="display:none;margin-top:6px">
+        <!-- MQTT note -->
+        <div class="note-mqtt" style="background:var(--panel2);border:1px solid var(--teal);border-radius:3px;padding:9px 11px;font-size:9px;color:var(--teal);line-height:1.8">
+          <b>⚡ WLED via MQTT — works on GitHub Pages, no local access needed.</b><br>
+          <span style="color:var(--dim)">Enable MQTT in WLED: <i>Settings → Sync Interfaces → MQTT</i><br>
+          Set the same broker + topic prefix. State arrives on <code style="background:var(--panel3);padding:1px 3px;border-radius:2px;color:var(--amber)">{prefix}/g</code>
+          <code style="background:var(--panel3);padding:1px 3px;border-radius:2px;color:var(--amber)">{prefix}/c</code>
+          <code style="background:var(--panel3);padding:1px 3px;border-radius:2px;color:var(--amber)">{prefix}/v</code></span>
+        </div>
+        <!-- WebSocket note -->
+        <div class="note-ws" style="display:none;background:var(--panel2);border:1px solid var(--purple);border-radius:3px;padding:9px 11px;font-size:9px;color:var(--purple);line-height:1.8">
+          <b>⚡ WLED via WebSocket — direct, fast, full state. No broker needed.</b><br>
+          <span style="color:var(--dim)">On HTTPS (GitHub Pages): browser will ask to allow mixed content <b>once</b>.<br>
+          Same as how <code style="background:var(--panel3);padding:1px 3px;border-radius:2px;color:var(--amber)">fetch(http://...)</code> works on your existing page — same permission.<br>
+          On HTTP (local server): just works, no prompts.</span>
+        </div>
+      </div>
+
     </div>
     <div class="modal-footer">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancel</button>
@@ -125,9 +141,9 @@
 
 <div id="toast"></div>
 
-<!-- Paho MQTT over WebSocket (relay controllers only — WLED uses direct WS) -->
+<!-- Paho MQTT (for MQTT device types) -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.1.0/paho-mqtt.min.js"
-  onerror="document.getElementById('conn-error').textContent='⚠ Failed to load Paho MQTT lib.';document.getElementById('conn-error').style.display='block'">
+  onerror="document.getElementById('conn-error').textContent='⚠ Paho failed to load.';document.getElementById('conn-error').style.display='block'">
 </script>
 <script src="remote.js"></script>
 </body>
