@@ -1,122 +1,144 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Relay Ctrl — Remote</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-tailwind.config = {
-  darkMode: 'class',
-  theme: { extend: { fontFamily: { mono: ['IBM Plex Mono','ui-monospace','monospace'] } } }
-}
-</script>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+<title>Relay Ctrl</title>
 <link rel="stylesheet" href="remote.css">
 </head>
-<body class="text-gray-200 h-screen flex flex-col overflow-hidden">
+<body>
 
 <!-- TOPBAR -->
-<header class="flex items-center gap-3 px-4 py-2.5 bg-gray-900/90 border-b border-gray-800 shrink-0">
-  <span class="text-lg">⚡</span>
-  <div class="leading-none">
-    <div class="text-xs font-semibold text-white tracking-widest">RELAY CTRL</div>
-    <div class="text-[9px] text-gray-600 tracking-wide">REMOTE DASHBOARD</div>
+<header class="topbar">
+  <div class="tb-brand">
+    <div class="tb-logo">⚡</div>
+    <div>
+      <div class="tb-name">Relay Ctrl</div>
+      <div class="tb-sub">Remote</div>
+    </div>
   </div>
-  <div class="w-px h-5 bg-gray-800 mx-1"></div>
-  <div><div class="text-[8px] text-gray-600">BROKER</div><div id="tb-broker" class="text-[10px] font-semibold text-red-400">DISCONNECTED</div></div>
-  <div class="w-px h-5 bg-gray-800 mx-1"></div>
-  <div><div class="text-[8px] text-gray-600">DEVICES</div><div id="tb-devices" class="text-[10px] font-semibold text-indigo-400">0</div></div>
-  <div class="ml-auto flex items-center gap-3">
-    <span class="flex items-center gap-1.5"><span id="conn-dot" class="w-2 h-2 rounded-full bg-gray-600 transition-colors"></span><span id="conn-lbl" class="text-[10px] text-gray-500">offline</span></span>
-    <span id="clock" class="text-[10px] text-gray-700 tabular-nums">--:--:--</span>
+  <div class="tb-seg">
+    <div class="tb-seg-lbl">Broker</div>
+    <div class="tb-seg-val" id="tb-broker" style="color:var(--red)">DISCONNECTED</div>
+  </div>
+  <div class="tb-seg">
+    <div class="tb-seg-lbl">Devices</div>
+    <div class="tb-seg-val" id="tb-devices" style="color:var(--amber)">0</div>
+  </div>
+  <div class="tb-right">
+    <div class="conn-pill" id="conn-pill">
+      <span class="conn-dot" id="conn-dot"></span>
+      <span id="conn-lbl">Offline</span>
+    </div>
+    <span id="clock">--:--:--</span>
   </div>
 </header>
 
 <!-- BODY -->
-<div class="flex flex-1 overflow-hidden">
+<div class="body-wrap">
 
-  <!-- SIDEBAR -->
-  <aside class="w-60 shrink-0 bg-gray-900/80 border-r border-gray-800 flex flex-col overflow-hidden">
+  <!-- MAIN (left) -->
+  <main id="main" class="main"></main>
+
+  <!-- RIGHT PANEL -->
+  <aside class="rpanel">
+
     <!-- Broker -->
-    <div class="p-3 border-b border-gray-800 shrink-0">
-      <div class="text-[8px] text-gray-600 tracking-widest mb-2.5">MQTT BROKER <span class="text-gray-700">(relay ctrl)</span></div>
-      <div class="space-y-1.5">
-        <input id="b-host" type="text" placeholder="broker.hivemq.com" class="inp w-full">
-        <div class="flex gap-1.5">
-          <input id="b-port" type="number" placeholder="Port" class="inp w-16">
-          <label class="flex items-center gap-1 text-[10px] text-gray-500 cursor-pointer whitespace-nowrap">
-            <input id="b-ssl" type="checkbox" class="w-3 h-3"> TLS
-          </label>
+    <div class="rp-sect">
+      <div class="rp-sect-title">MQTT Broker</div>
+      <div class="gap6">
+        <input id="b-host" type="text" placeholder="broker.hivemq.com" class="inp">
+        <div class="inp-row">
+          <input id="b-port" type="number" placeholder="Port" class="inp" style="width:70px">
+          <label class="chk-lbl"><input id="b-ssl" type="checkbox"> TLS</label>
         </div>
-        <div id="https-note" class="hidden text-[9px] text-amber-400 leading-relaxed">⚠ HTTPS — TLS forced. Port <b>8884</b> for HiveMQ.</div>
-        <input id="b-user" type="text" placeholder="User (optional)" class="inp w-full">
-        <input id="b-pass" type="password" placeholder="Password" class="inp w-full">
-        <div class="flex gap-1.5 pt-0.5">
-          <button id="btn-conn" onclick="mqttConnect()" class="flex-1 bg-amber-500 hover:bg-amber-400 text-black text-[10px] font-bold py-1.5 rounded transition-colors">⚡ Connect</button>
-          <button id="btn-disc" onclick="mqttDisconnect()" style="display:none" class="flex-1 bg-red-700 hover:bg-red-600 text-white text-[10px] font-semibold py-1.5 rounded transition-colors">✕ Disc.</button>
+        <input id="b-user" type="text" placeholder="Username (optional)" class="inp">
+        <input id="b-pass" type="password" placeholder="Password" class="inp">
+        <div id="https-note" class="https-note hidden">⚠ HTTPS — TLS forced. Use port <b>8884</b> for HiveMQ WSS.</div>
+        <div class="btn-row">
+          <button id="btn-conn" onclick="mqttConnect()" class="btn btn-green btn-full">⚡ Connect</button>
+          <button id="btn-disc" onclick="mqttDisconnect()" class="btn btn-red btn-full" style="display:none">✕ Disc.</button>
         </div>
-        <div id="conn-err" class="hidden text-[9px] text-red-400 leading-relaxed whitespace-pre-wrap"></div>
+        <div id="conn-err" class="conn-err hidden"></div>
       </div>
     </div>
-    <!-- Device list -->
-    <div class="px-3 pt-2.5 pb-1 shrink-0">
-      <div class="text-[8px] text-gray-600 tracking-widest">DEVICES</div>
-    </div>
-    <div id="dev-list" class="flex-1 px-2 pb-1 space-y-1 overflow-y-auto min-h-0"></div>
-    <div class="p-2 shrink-0 border-t border-gray-800">
-      <button onclick="openAdd()" class="w-full border border-dashed border-gray-700 hover:border-indigo-500 text-gray-600 hover:text-indigo-400 text-[10px] py-2 rounded transition-colors">+ Add Device</button>
-    </div>
-  </aside>
 
-  <!-- MAIN -->
-  <main id="main" class="flex-1 p-4 overflow-y-auto min-h-0"></main>
+    <!-- Devices -->
+    <div class="rp-sect" style="border-bottom:none;padding-bottom:6px">
+      <div class="rp-sect-title">Devices</div>
+    </div>
+    <div id="dev-list" class="dev-list"></div>
+    <div class="dev-add-wrap">
+      <button onclick="openAdd()" class="btn btn-ghost btn-full">＋ Add Device</button>
+    </div>
+
+  </aside>
 </div>
 
 <!-- MODAL -->
-<div id="modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50" onclick="if(event.target===this)closeModal()">
-  <div class="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-sm mx-4 shadow-2xl">
-    <div class="flex items-center justify-between px-5 py-4 border-b border-gray-800">
-      <span id="modal-title" class="text-sm font-semibold text-white">Add Device</span>
-      <button onclick="closeModal()" class="text-gray-600 hover:text-white text-lg leading-none">✕</button>
+<div id="modal" class="modal-ov hidden" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-hd">
+      <span id="modal-title" class="modal-title">Add Device</span>
+      <button class="modal-x" onclick="closeModal()">✕</button>
     </div>
-    <div class="px-5 py-4 space-y-3">
+    <div class="modal-body">
       <input type="hidden" id="dm-id">
-      <div><label class="lbl">Name</label><input id="dm-name" type="text" placeholder="Greenhouse, Workshop…" class="inp w-full mt-1"></div>
-      <div>
-        <label class="lbl">Type</label>
-        <select id="dm-type" onchange="onTypeChange()" class="inp w-full mt-1">
+      <div class="modal-field">
+        <label class="modal-lbl">Name</label>
+        <input id="dm-name" type="text" placeholder="Greenhouse, Workshop…" class="inp">
+      </div>
+      <div class="modal-field">
+        <label class="modal-lbl">Type</label>
+        <select id="dm-type" onchange="onTypeChange()" class="inp">
           <option value="mqtt">Relay Controller (MQTT)</option>
-          <option value="wled">WLED Device (WebSocket / MQTT)</option>
+          <option value="wled">WLED Device</option>
         </select>
       </div>
-      <div id="dm-mqtt" class="space-y-3">
-        <div><label class="lbl">Topic Prefix</label><input id="dm-prefix" type="text" placeholder="home/relay" class="inp w-full mt-1"><p class="hint">Must match firmware config prefix.</p></div>
-        <div><label class="lbl">Ping Interval (sec)</label><input id="dm-ping" type="number" value="10" class="inp w-full mt-1"></div>
+
+      <!-- MQTT fields -->
+      <div id="dm-mqtt-fields">
+        <div class="modal-field">
+          <label class="modal-lbl">Topic Prefix</label>
+          <input id="dm-prefix" type="text" placeholder="home/relay" class="inp">
+          <span class="modal-hint">Must match firmware config prefix.</span>
+        </div>
+        <div class="modal-field">
+          <label class="modal-lbl">Ping Interval (sec)</label>
+          <input id="dm-ping" type="number" value="10" class="inp">
+        </div>
       </div>
-      <div id="dm-wled" class="hidden space-y-3">
-        <div><label class="lbl">WLED IP</label><input id="dm-host" type="text" placeholder="192.168.1.10" class="inp w-full mt-1"><p class="hint">Connects via <code class="text-gray-400">ws://ip/ws</code> — HTTP only.</p></div>
-        <div><label class="lbl">MQTT Device Topic <span class="text-gray-600">(HTTPS/GitHub Pages)</span></label><input id="dm-wtopic" type="text" placeholder="wled/XXXXXX" class="inp w-full mt-1"><p class="hint">WLED → Config → Sync → MQTT → Device Topic.</p></div>
-        <div class="border-t border-gray-800 pt-3"><label class="lbl">GPIO Monitor Prefix <span class="text-gray-600">(optional)</span></label><input id="dm-gpio-prefix" type="text" placeholder="home/gpio" class="inp w-full mt-1"><p class="hint">GPIO Monitor usermod MQTT prefix. Leave blank if not installed.</p></div>
+
+      <!-- WLED fields -->
+      <div id="dm-wled-fields" class="hidden">
+        <div class="modal-field">
+          <label class="modal-lbl">WLED IP Address</label>
+          <input id="dm-host" type="text" placeholder="192.168.1.10" class="inp">
+          <span class="modal-hint">HTTP commands + polling work from both HTTP and HTTPS pages. WebSocket used on HTTP for real-time push.</span>
+        </div>
+        <hr class="modal-hr">
+        <div class="modal-field">
+          <label class="modal-lbl">MQTT Topic <span style="color:var(--text-d);font-weight:400">(real-time on HTTPS)</span></label>
+          <input id="dm-wtopic" type="text" placeholder="wled/XXXXXX" class="inp">
+          <span class="modal-hint">WLED → Config → Sync → MQTT → Device Topic. Only needed for live push on HTTPS pages.</span>
+        </div>
+        <hr class="modal-hr">
+        <div class="modal-field">
+          <label class="modal-lbl">GPIO Monitor Prefix <span style="color:var(--text-d);font-weight:400">(optional)</span></label>
+          <input id="dm-gpio-prefix" type="text" placeholder="home/gpio" class="inp">
+          <span class="modal-hint">GPIO Monitor usermod MQTT prefix. HTTP polling always works if IP is set.</span>
+        </div>
       </div>
     </div>
-    <div class="flex gap-2 px-5 pb-5">
-      <button onclick="closeModal()" class="flex-1 border border-gray-700 hover:border-gray-500 text-gray-500 text-xs py-2 rounded transition-colors">Cancel</button>
-      <button onclick="saveDevice()" class="flex-[2] bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold py-2 rounded transition-colors">Save</button>
+    <div class="modal-ft">
+      <button onclick="closeModal()" class="btn btn-ghost" style="flex:1">Cancel</button>
+      <button onclick="saveDevice()" class="btn btn-green" style="flex:2">Save</button>
     </div>
   </div>
 </div>
 
 <!-- TOAST -->
-<div id="toast" class="fixed bottom-5 right-5 z-50 text-xs px-4 py-2.5 rounded-lg shadow-xl opacity-0 translate-y-2 transition-all duration-300 pointer-events-none"></div>
-
-<style>
-  .inp { background:#1f2937;border:1px solid #374151;border-radius:6px;padding:6px 10px;font-size:10px;color:#e5e7eb;outline:none; }
-  .inp:focus { border-color:#6366f1; }
-  .lbl { font-size:9px;color:#6b7280;letter-spacing:.05em; }
-  .hint { font-size:9px;color:#4b5563;margin-top:3px;line-height:1.6; }
-  select.inp { cursor:pointer; }
-</style>
+<div id="toast" class="toast"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.1.0/paho-mqtt.min.js"></script>
 <script src="remote.js"></script>
